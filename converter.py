@@ -121,6 +121,7 @@ def anthropic_to_openai(req: dict) -> dict:
     # Tools
     if req.get("tools"):
         openai_req["tools"] = []
+        _TOOL_KNOWN = {"name", "description", "input_schema", "strict", "type", "cache_control"}
         for t in req["tools"]:
             fn: dict = {
                 "name": t["name"],
@@ -129,6 +130,10 @@ def anthropic_to_openai(req: dict) -> dict:
             }
             if t.get("strict") is not None:
                 fn["strict"] = t["strict"]
+            # Forward any unknown fields (e.g. defer_loading) as-is
+            for k, v in t.items():
+                if k not in _TOOL_KNOWN:
+                    fn[k] = v
             openai_req["tools"].append({"type": "function", "function": fn})
 
     # Tool choice
