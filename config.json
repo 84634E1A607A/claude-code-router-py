@@ -4,7 +4,7 @@
   "Providers": [
     {
       "name": "zai",
-      "api_base_url": "http://172.27.10.48:8000/v1/chat/completions",
+      "api_base_url": "http://0.0.0.0:8000/v1/chat/completions",
       "api_key": "sk-xxx",
       "max_retries": 3,
       "params": {

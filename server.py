@@ -3,19 +3,19 @@ FastAPI server — accepts Anthropic /v1/messages requests and forwards them
 to an OpenAI-compatible provider, converting formats in both directions.
 """
 
+import json
 import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
-import json
-
 from batch import anthropic_batch_to_openai_jsonl, openai_batch_to_anthropic, openai_results_line_to_anthropic
-from client import ProviderError, post_json, stream_lines
+from client import ProviderError, ProviderStream, close_shared_client, get_shared_client, open_provider_stream, post_json
 from config import apply_provider_params, get_provider, load_config, resolve_route
 from converter import anthropic_to_openai, openai_to_anthropic, stream_openai_to_anthropic
 from debug import check_and_save_nonstreaming, check_and_save_streaming
@@ -43,6 +43,7 @@ async def lifespan(app: FastAPI):
             logger.error("Failed to load config %s: %s", path, exc)
             raise
     yield
+    await close_shared_client()
 
 
 app = FastAPI(title="Claude Code Router (Python)", lifespan=lifespan)
@@ -51,6 +52,11 @@ app = FastAPI(title="Claude Code Router (Python)", lifespan=lifespan)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _timeout() -> float:
+    """Read API_TIMEOUT_MS from config, handling string or numeric values."""
+    return float(_config.get("API_TIMEOUT_MS", 600_000)) / 1000
+
 
 def _provider_headers(provider: dict) -> dict:
     api_key = provider.get("api_key", "")
@@ -80,6 +86,8 @@ def _api_base(provider: dict) -> str:
     for suffix in ("/chat/completions", "/completions", "/models", "/batches", "/files"):
         if url.endswith(suffix):
             return url[: -len(suffix)]
+    if url.rstrip("/").endswith("/v1"):
+        return url.rstrip("/")
     return url.rsplit("/", 1)[0]
 
 
@@ -162,13 +170,22 @@ async def messages(request: Request):
 
     headers = _provider_headers(provider)
     max_retries: int = provider.get("max_retries", 3)
-    timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+    timeout = _timeout()
 
     is_stream = openai_req.get("stream", False)
 
     if is_stream:
+        # Eagerly connect to check provider status before committing to HTTP 200
+        try:
+            stream = await open_provider_stream(url, headers, openai_req, timeout, max_retries)
+        except ProviderError as exc:
+            raise HTTPException(exc.status or 502, exc.body or str(exc))
+        except Exception as exc:
+            logger.exception("Stream connection error")
+            raise HTTPException(502, str(exc))
+
         return StreamingResponse(
-            _stream_response(openai_req, url, headers, model, max_retries, timeout),
+            _stream_response(openai_req, stream, model),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -195,24 +212,19 @@ async def messages(request: Request):
 
 async def _stream_response(
     openai_req: dict,
-    url: str,
-    headers: dict,
+    stream: ProviderStream,
     model: str,
-    max_retries: int,
-    timeout: float,
 ) -> AsyncIterator[str]:
     import json as _json
     from debug import is_enabled as _debug_enabled
 
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
-    _text_buf: list[str] = [] if _debug_enabled() else []
+    _text_buf: list[str] | None = [] if _debug_enabled() else None
 
     try:
-        lines = stream_lines(url, headers, openai_req, timeout=timeout, max_retries=max_retries)
-        async for event in stream_openai_to_anthropic(lines, message_id, model):
-            # Accumulate text for debug check (zero cost when CCR_DEBUG is off
-            # because check_and_save_streaming is a no-op in that case)
-            if _debug_enabled():
+        async for event in stream_openai_to_anthropic(stream, message_id, model):
+            # Accumulate text for debug check (zero cost when CCR_DEBUG is off)
+            if _text_buf is not None:
                 for line in event.split("\n"):
                     if line.startswith("data: "):
                         try:
@@ -223,13 +235,6 @@ async def _stream_response(
                         except _json.JSONDecodeError:
                             pass
             yield event
-    except ProviderError as exc:
-        error_event = {
-            "type": "error",
-            "error": {"type": "api_error", "message": exc.body or str(exc)},
-        }
-        yield f"event: error\ndata: {_json.dumps(error_event)}\n\n"
-        return
     except Exception as exc:
         logger.exception("Streaming error")
         error_event = {
@@ -238,8 +243,10 @@ async def _stream_response(
         }
         yield f"event: error\ndata: {_json.dumps(error_event)}\n\n"
         return
-
-    check_and_save_streaming(openai_req, "".join(_text_buf))
+    finally:
+        await stream.aclose()
+        if _text_buf is not None:
+            check_and_save_streaming(openai_req, "".join(_text_buf))
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +313,7 @@ async def list_models(before_id: str | None = None,
 
     url = _models_url(provider)
     headers = _provider_headers(provider)
-    timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+    timeout = _timeout()
     params: dict = {"limit": limit}
     if before_id:
         params["before"] = before_id
@@ -314,9 +321,8 @@ async def list_models(before_id: str | None = None,
         params["after"] = after_id
 
     try:
-        import httpx
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.get(url, headers=headers, params=params)
+        client = get_shared_client()
+        r = await client.get(url, headers=headers, params=params, timeout=timeout)
         if r.status_code >= 400:
             raise HTTPException(r.status_code, r.text)
         data = r.json()
@@ -344,12 +350,11 @@ async def get_model(model_id: str):
 
     url = _models_url(provider) + f"/{model_id}"
     headers = _provider_headers(provider)
-    timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+    timeout = _timeout()
 
     try:
-        import httpx
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.get(url, headers=headers)
+        client = get_shared_client()
+        r = await client.get(url, headers=headers, timeout=timeout)
         if r.status_code >= 400:
             raise HTTPException(r.status_code, r.text)
         return _openai_model_to_anthropic(r.json())
@@ -366,29 +371,33 @@ async def get_model(model_id: str):
 
 def _parse_legacy_prompt(prompt: str) -> list[dict]:
     """
-    Convert a legacy \n\nHuman: / \n\nAssistant: prompt string into a messages list.
+    Convert a legacy \\n\\nHuman: / \\n\\nAssistant: prompt string into a messages list.
     Falls back to a single user message if the format is not recognized.
     """
-    messages = []
-    # Split on alternating Human/Assistant turns
     import re
-    parts = re.split(r'\n\nHuman: |\n\nAssistant: ', prompt)
-    # Determine if prompt starts with Human or Assistant
-    if '\n\nHuman: ' in prompt:
-        first_role = "user"
-    else:
-        messages.append({"role": "user", "content": prompt.strip()})
-        return messages
 
-    roles = []
-    current = "user"
-    for part in parts:
-        if part.strip():
-            roles.append((current, part.strip()))
-        current = "assistant" if current == "user" else "user"
+    has_human = '\n\nHuman: ' in prompt
+    has_assistant_start = prompt.lstrip().startswith('\n\nAssistant: ')
 
-    for role, content in roles:
-        messages.append({"role": role, "content": content})
+    if not has_human and not has_assistant_start:
+        return [{"role": "user", "content": prompt.strip()}]
+
+    messages = []
+    # Split on delimiters, keeping track of which delimiter was matched
+    parts = re.split(r'(\n\nHuman: |\n\nAssistant: )', prompt)
+    current_role = "user" if has_human else "assistant"
+    i = 0
+    while i < len(parts):
+        text = parts[i]
+        if text in ('\n\nHuman: ', '\n\nAssistant: '):
+            current_role = "user" if 'Human' in text else "assistant"
+            i += 1
+            continue
+        text = text.strip()
+        if text:
+            messages.append({"role": current_role, "content": text})
+        i += 1
+
     return messages or [{"role": "user", "content": prompt.strip()}]
 
 
@@ -419,7 +428,7 @@ async def legacy_complete(request: Request):
 
     openai_req = apply_provider_params(provider, openai_req)
     headers = _provider_headers(provider)
-    timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+    timeout = _timeout()
 
     try:
         openai_resp = await post_json(url, headers, openai_req, timeout=timeout)
@@ -447,19 +456,17 @@ async def legacy_complete(request: Request):
 # Batch API
 # ---------------------------------------------------------------------------
 
-async def _httpx_get(url: str, headers: dict, timeout: float) -> dict:
-    import httpx
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.get(url, headers=headers)
+async def _httpx_get(url: str, headers: dict, timeout: float, **kwargs) -> dict:
+    client = get_shared_client()
+    r = await client.get(url, headers=headers, timeout=timeout, **kwargs)
     if r.status_code >= 400:
         raise HTTPException(r.status_code, r.text)
     return r.json()
 
 
 async def _httpx_delete(url: str, headers: dict, timeout: float) -> dict:
-    import httpx
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.delete(url, headers=headers)
+    client = get_shared_client()
+    r = await client.delete(url, headers=headers, timeout=timeout)
     if r.status_code >= 400:
         raise HTTPException(r.status_code, r.text)
     return r.json() if r.text else {}
@@ -490,13 +497,12 @@ async def create_batch(request: Request):
     jsonl_bytes = jsonl_content.encode()
 
     headers = _provider_headers(provider)
-    timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+    timeout = _timeout()
     files_url = _files_url(provider)
     batches_url = _batches_url(provider)
 
-    import httpx
     try:
-        # Upload input file
+        # Upload input file (use a fresh client for multipart upload)
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.post(
                 files_url,
@@ -534,7 +540,7 @@ async def list_batches(request: Request,
         raise
 
     headers = _provider_headers(provider)
-    timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+    timeout = _timeout()
     url = _batches_url(provider)
     params = {"limit": limit}
     if before_id:
@@ -542,13 +548,8 @@ async def list_batches(request: Request,
     if after_id:
         params["after"] = after_id
 
-    import httpx
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.get(url, headers=headers, params=params)
-        if r.status_code >= 400:
-            raise HTTPException(r.status_code, r.text)
-        data = r.json()
+        data = await _httpx_get(url, headers, timeout, params=params)
     except HTTPException:
         raise
     except Exception as exc:
@@ -573,7 +574,7 @@ async def get_batch(batch_id: str, request: Request):
         raise
 
     headers = _provider_headers(provider)
-    timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+    timeout = _timeout()
 
     try:
         data = await _httpx_get(_batches_url(provider) + f"/{batch_id}", headers, timeout)
@@ -594,15 +595,15 @@ async def cancel_batch(batch_id: str, request: Request):
         raise
 
     headers = _provider_headers(provider)
-    timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+    timeout = _timeout()
 
-    import httpx
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(
-                _batches_url(provider) + f"/{batch_id}/cancel",
-                headers=headers,
-            )
+        client = get_shared_client()
+        r = await client.post(
+            _batches_url(provider) + f"/{batch_id}/cancel",
+            headers=headers,
+            timeout=timeout,
+        )
         if r.status_code >= 400:
             raise HTTPException(r.status_code, r.text)
         data = r.json()
@@ -623,7 +624,7 @@ async def delete_batch(batch_id: str):
         raise
 
     headers = _provider_headers(provider)
-    timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+    timeout = _timeout()
 
     try:
         await _httpx_delete(_batches_url(provider) + f"/{batch_id}", headers, timeout)
@@ -645,7 +646,7 @@ async def batch_results(batch_id: str, request: Request):
         raise
 
     headers = _provider_headers(provider)
-    timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+    timeout = _timeout()
 
     # Get the batch to find output_file_id
     try:
@@ -661,7 +662,6 @@ async def batch_results(batch_id: str, request: Request):
         raise HTTPException(404, f"Batch results not available yet (status: {status})")
 
     async def _stream_results():
-        import httpx
         url = _files_url(provider) + f"/{file_id}/content"
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
             async with client.stream("GET", url, headers=headers) as resp:

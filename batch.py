@@ -35,6 +35,8 @@ def anthropic_batch_to_openai_jsonl(requests: list[dict], model: str) -> str:
         params.pop("stream", None)  # batches are never streaming
 
         openai_body = anthropic_to_openai(params)
+        openai_body.pop("stream", None)
+        openai_body.pop("stream_options", None)
         lines.append(json.dumps({
             "custom_id": req["custom_id"],
             "method": "POST",

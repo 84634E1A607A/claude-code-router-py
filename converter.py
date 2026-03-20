@@ -149,8 +149,7 @@ def anthropic_to_openai(req: dict) -> dict:
                 "type": "function",
                 "function": {"name": tc["name"]},
             }
-        elif tc_type == "none":
-            openai_req["tool_choice"] = "none"
+        # tool_choice "none" is not a standard Anthropic value; omit it
         # disable_parallel_tool_use on any variant
         if tc.get("disable_parallel_tool_use"):
             openai_req["parallel_tool_calls"] = False

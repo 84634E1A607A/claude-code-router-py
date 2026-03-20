@@ -211,7 +211,8 @@ class TestAnthropicToOpenAI(unittest.TestCase):
     def test_tool_choice_none(self):
         out = anthropic_to_openai({"model": "m", "messages": [],
                                    "tool_choice": {"type": "none"}})
-        self.assertEqual(out["tool_choice"], "none")
+        # tool_choice "none" is not standard Anthropic; it should be omitted
+        self.assertNotIn("tool_choice", out)
 
     def test_disable_parallel_tool_use(self):
         out = anthropic_to_openai({"model": "m", "messages": [],
