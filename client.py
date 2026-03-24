@@ -49,6 +49,11 @@ class ProviderStream:
             if line:
                 yield line.encode()
 
+    async def aiter_raw(self):
+        async for chunk in self._response.aiter_raw():
+            if chunk:
+                yield chunk
+
     async def aclose(self):
         await self._response.aclose()
         await self._client.aclose()

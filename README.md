@@ -300,3 +300,11 @@ CLI flags override the corresponding `config.json` values.
 |---|---|---|
 | `POST` | `/v1/messages` | Main Messages API — streaming and non-streaming |
 | `GET` | `/health` | Returns `{"status": "ok"}` |
+
+
+```
+TOKENIZER_PATH=/your/tokenizer/path \
+ROUTER_URL=http://your-router:8080 \
+MODEL=GLM-5 \
+gunicorn -k uvicorn.workers.UvicornWorker -w 1 -b 0.0.0.0:8890 chat_to_generate_adapter:app
+```
