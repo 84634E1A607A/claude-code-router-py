@@ -1,6 +1,6 @@
 import importlib
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 
 with patch("transformers.AutoTokenizer.from_pretrained", return_value=Mock()):
@@ -59,6 +59,53 @@ class TestMainKeyResolution(unittest.TestCase):
         )
 
         self.assertEqual(request["main_key"], "claude-session-456")
+
+class TestStreamingPaths(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.adapter = chat_to_generate_adapter.ChatToGenerateAdapter(
+            use_generate_api=False,
+            use_completions_for_chat=False,
+        )
+
+    async def test_process_chat_via_generate_preserves_stream(self):
+        self.adapter._build_generate_request = Mock(return_value={"model": "m", "text": "prompt"})
+        self.adapter._mock_generate_to_chat_stream = AsyncMock(return_value="stream-response")
+
+        out = await self.adapter._process_chat_via_generate({"stream": True}, {})
+
+        self.assertEqual(out, "stream-response")
+        self.assertNotIn("stream", self.adapter._build_generate_request.return_value)
+        self.adapter._mock_generate_to_chat_stream.assert_awaited_once()
+
+    async def test_process_chat_via_completions_preserves_stream(self):
+        self.adapter.tokenizer = Mock()
+        self.adapter.tokenizer.apply_chat_template.return_value = "prompt"
+        self.adapter._stream_completions_to_chat = AsyncMock(return_value="stream-response")
+
+        out = await self.adapter._process_chat_via_completions(
+            {
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+            {},
+        )
+
+        self.assertEqual(out, "stream-response")
+        streamed_request = self.adapter._stream_completions_to_chat.await_args.args[0]
+        self.assertTrue(streamed_request["stream"])
+
+    async def test_process_completions_via_v1_preserves_stream(self):
+        self.adapter._stream_raw_provider_response = AsyncMock(return_value="stream-response")
+
+        out = await self.adapter._process_completions_via_v1(
+            {"model": "m", "prompt": "hi", "stream": True},
+            {},
+        )
+
+        self.assertEqual(out, "stream-response")
+        streamed_request = self.adapter._stream_raw_provider_response.await_args.args[2]
+        self.assertTrue(streamed_request["stream"])
 
 
 if __name__ == "__main__":

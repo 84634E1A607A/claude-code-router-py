@@ -11,8 +11,10 @@ from typing import Any, Dict, List, Optional
 import httpx
 import orjson
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import StreamingResponse
 from transformers import AutoTokenizer
 import re
+from client import ProviderError, ProviderStream, open_provider_stream
 
 
 import re
@@ -128,7 +130,6 @@ def parse_message_local(completion_text, model_type, tools):
         fn_body = None
 
     if not fn_name:
-        print(f"haoran - No function name found in text: {text[:100]}")
         return {"role": "assistant", "content": content, "reasoning_content": reasoning_content, "tool_calls": []}
 
     matching_tool = next(
@@ -137,7 +138,6 @@ def parse_message_local(completion_text, model_type, tools):
     )
 
     if not matching_tool:
-        print(f"haoran - No matching tool found for function name: {fn_name}")
         return {
             "role": "assistant",
             "content": tool_call_text,
@@ -149,7 +149,6 @@ def parse_message_local(completion_text, model_type, tools):
     try:
         params = _extract_and_validate_params(matching_tool, param_matches, fn_name)
     except ValueError as e:
-        print(f"haoran - Parameter extraction/validation error: {e}")
         return {
             "role": "assistant",
             "content": tool_call_text,
@@ -423,7 +422,7 @@ class ChatToGenerateAdapter:
         parsed_response: Dict[str, Any],
         usage: Optional[Dict[str, int]] = None,
         finish_reason: str = "stop",
-    ) -> Dict[str, Any]:
+    ) -> Any:
         """
         Build chat completions format response
 
@@ -463,6 +462,188 @@ class ChatToGenerateAdapter:
             ],
             "usage": usage,
         }
+
+    def _streaming_response(self, iterator) -> StreamingResponse:
+        return StreamingResponse(
+            iterator,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    def _chat_chunk_sse(
+        self,
+        request_id: str,
+        created: int,
+        model: str,
+        content: Optional[str] = None,
+        reasoning_content: Optional[str] = None,
+        finish_reason: Optional[str] = None,
+        usage: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        delta: Dict[str, Any] = {}
+        if content:
+            delta["content"] = content
+        if reasoning_content:
+            delta["reasoning_content"] = reasoning_content
+
+        payload: Dict[str, Any] = {
+            "id": f"chatcmpl-{request_id}",
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                }
+            ],
+        }
+        if usage is not None:
+            payload["usage"] = usage
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    async def _stream_raw_provider_response(
+        self,
+        url: str,
+        headers: Dict[str, str],
+        body: Dict[str, Any],
+        timeout: float = 1800.0,
+        max_retries: int = 10,
+    ) -> StreamingResponse:
+        print(f"[stream] opening raw provider stream: {url}")
+        stream = await open_provider_stream(url, headers, body, timeout=timeout, max_retries=max_retries)
+        print(f"[stream] raw provider stream established: {url}")
+
+        async def iterator():
+            try:
+                async for chunk in stream.aiter_raw():
+                    yield chunk
+            finally:
+                await stream.aclose()
+
+        return self._streaming_response(iterator())
+
+    async def _mock_generate_to_chat_stream(
+        self,
+        generate_request: Dict[str, Any],
+        headers: Dict[str, str],
+        chat_request: Dict[str, Any],
+    ) -> StreamingResponse:
+        request_id = str(uuid.uuid4())
+        created = int(time.time())
+        upstream_request = dict(generate_request)
+        upstream_request.pop("stream", None)
+
+        print(f"[stream] mocking chat stream from non-stream generate: {self.router_url}/generate")
+        resp = await self.forward_request(upstream_request, headers)
+        if resp.status_code != 200:
+            raise RuntimeError(f"sglang returned status {resp.status_code}: {resp.text[:500]}")
+
+        response_data = resp.json()
+        text = response_data.get("text", "")
+        tools_for_parser = []
+        for tool in chat_request.get("tools", []):
+            if "function" in tool:
+                tool_to_dump = tool["function"]
+            else:
+                tool_to_dump = tool
+            tools_for_parser.append(tool_to_dump)
+        parsed = parse_message_local(text, "glm47", tools_for_parser)
+        content = parsed.get("content", "")
+        reasoning_content = parsed.get("reasoning_content", "")
+        if content.endswith("<|user|>"):
+            content = content[:-8].rstrip()
+
+        meta_info = response_data.get("meta_info", {}) or {}
+        usage = {
+            "prompt_tokens": meta_info.get("prompt_tokens", 0),
+            "completion_tokens": meta_info.get("completion_tokens", 0),
+            "total_tokens": meta_info.get("prompt_tokens", 0) + meta_info.get("completion_tokens", 0),
+        }
+        finish_reason = meta_info.get("finish_reason", {}).get("type", "stop")
+
+        async def iterator():
+            if reasoning_content:
+                yield self._chat_chunk_sse(
+                    request_id,
+                    created,
+                    self.model,
+                    reasoning_content=reasoning_content,
+                )
+            if content:
+                yield self._chat_chunk_sse(request_id, created, self.model, content=content)
+            yield self._chat_chunk_sse(
+                request_id,
+                created,
+                self.model,
+                finish_reason=finish_reason,
+                usage=usage,
+            )
+            yield "data: [DONE]\n\n"
+
+        return self._streaming_response(iterator())
+
+    async def _stream_completions_to_chat(
+        self,
+        completions_request: Dict[str, Any],
+        request_headers: Dict[str, str],
+    ) -> StreamingResponse:
+        headers = {
+            "Content-Type": "application/json",
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        url = f"{self.router_url}/v1/completions"
+        print(f"[stream] opening completions stream: {url}")
+        stream = await open_provider_stream(url, headers, completions_request, timeout=1800.0, max_retries=10)
+        print(f"[stream] completions stream established: {url}")
+        request_id = str(uuid.uuid4())
+        created = int(time.time())
+
+        async def iterator():
+            try:
+                async for raw in stream:
+                    line = raw.decode("utf-8", errors="ignore").strip()
+                    if not line.startswith("data: "):
+                        continue
+                    payload = line[6:]
+                    if payload == "[DONE]":
+                        yield "data: [DONE]\n\n"
+                        return
+
+                    try:
+                        chunk = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+
+                    choice = choices[0]
+                    text = choice.get("text", "")
+                    finish_reason = choice.get("finish_reason")
+                    usage = chunk.get("usage")
+
+                    if text:
+                        yield self._chat_chunk_sse(request_id, created, self.model, content=text)
+                    if finish_reason is not None:
+                        yield self._chat_chunk_sse(
+                            request_id,
+                            created,
+                            self.model,
+                            finish_reason=finish_reason,
+                            usage=usage,
+                        )
+            finally:
+                await stream.aclose()
+
+        return self._streaming_response(iterator())
 
     async def forward_request(
         self,
@@ -535,9 +716,10 @@ class ChatToGenerateAdapter:
         self,
         chat_request: Dict[str, Any],
         request_headers: Dict[str, str],
-    ) -> Dict[str, Any]:
+    ) -> Any:
         request_id = str(uuid.uuid4())
         generate_request = self._build_generate_request(chat_request)
+        is_stream = bool(chat_request.get("stream"))
         headers = {
             k: v
             for k, v in request_headers.items()
@@ -546,6 +728,9 @@ class ChatToGenerateAdapter:
         headers["Content-Type"] = "application/json"
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+
+        if is_stream:
+            return await self._mock_generate_to_chat_stream(generate_request, headers, chat_request)
 
         # Forward to sglang generate
         try:
@@ -589,11 +774,9 @@ class ChatToGenerateAdapter:
         self,
         chat_request: Dict[str, Any],
         request_headers: Dict[str, str],
-    ) -> Dict[str, Any]:
+    ) -> Any:
         """Pass through to v1/chat/completions API (for OpenAI-compatible APIs like ZhipuAI)"""
-        # Ensure stream is explicitly set to False if not specified
-        if "stream" not in chat_request:
-            chat_request["stream"] = False
+        is_stream = bool(chat_request.get("stream"))
 
         # Prepare headers - don't inherit client headers, build fresh ones
         headers = {
@@ -601,6 +784,13 @@ class ChatToGenerateAdapter:
         }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+
+        if is_stream:
+            return await self._stream_raw_provider_response(
+                f"{self.router_url}/v1/chat/completions",
+                headers,
+                chat_request,
+            )
 
         # Forward to v1/chat/completions with retry
         client = await self.get_http_client()
@@ -667,7 +857,7 @@ class ChatToGenerateAdapter:
         self,
         chat_request: Dict[str, Any],
         request_headers: Dict[str, str],
-    ) -> Dict[str, Any]:
+    ) -> Any:
         """
         Convert chat/completions to v1/completions, then convert back to chat format
         This avoids streaming issues with chat/completions API
@@ -712,7 +902,7 @@ class ChatToGenerateAdapter:
             "max_tokens": chat_request.get("max_tokens", DEFAULT_MAX_TOKENS),
             "temperature": chat_request.get("temperature", 0.0),
             "top_p": chat_request.get("top_p", 0.95),
-            "stream": False,  # Force non-streaming
+            "stream": bool(chat_request.get("stream")),
         }
 
         if "stop" in chat_request:
@@ -721,6 +911,9 @@ class ChatToGenerateAdapter:
         main_key = self._resolve_main_key(chat_request)
         if main_key is not None:
             completions_request["main_key"] = main_key
+
+        if completions_request["stream"]:
+            return await self._stream_completions_to_chat(completions_request, request_headers)
 
         completions_response = await self._process_completions_via_v1(completions_request, request_headers)
 
@@ -795,7 +988,7 @@ class ChatToGenerateAdapter:
         self,
         completions_request: Dict[str, Any],
         request_headers: Dict[str, str],
-    ) -> Dict[str, Any]:
+    ) -> Any:
         """
         Process v1/completions request (raw text completion)
 
@@ -816,10 +1009,9 @@ class ChatToGenerateAdapter:
         self,
         completions_request: Dict[str, Any],
         request_headers: Dict[str, str],
-    ) -> Dict[str, Any]:
+    ) -> Any:
         """Pass through to v1/completions API"""
-        # Ensure stream is explicitly set to False if not specified
-        completions_request["stream"] = False
+        is_stream = bool(completions_request.get("stream"))
 
         # Prepare headers - don't inherit client headers, build fresh ones
         headers = {
@@ -827,6 +1019,13 @@ class ChatToGenerateAdapter:
         }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+
+        if is_stream:
+            return await self._stream_raw_provider_response(
+                f"{self.router_url}/v1/completions",
+                headers,
+                completions_request,
+            )
 
         # Forward to v1/completions with retry
         client = await self.get_http_client()
@@ -889,7 +1088,7 @@ class ChatToGenerateAdapter:
         request_data: Dict[str, Any],
         request_headers: Dict[str, str],
         api_type: str = "chat",
-    ) -> Dict[str, Any]:
+    ) -> Any:
         """
         Process request based on API type
 
@@ -967,6 +1166,8 @@ async def chat_completions(request: Request):
 
     try:
         response = await _get_adapter(request).process_request(chat_request, dict(request.headers), api_type="chat")
+        if isinstance(response, Response):
+            return response
 
         return Response(content=orjson.dumps(response), status_code=200, media_type="application/json")
 
@@ -994,6 +1195,8 @@ async def completions(request: Request):
         response = await _get_adapter(request).process_request(
             completions_request, dict(request.headers), api_type="completions"
         )
+        if isinstance(response, Response):
+            return response
 
         return Response(content=orjson.dumps(response), status_code=200, media_type="application/json")
 
