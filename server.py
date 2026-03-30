@@ -315,7 +315,7 @@ async def count_tokens(request: Request):
 
     tokenizer_path = provider.get("tokenizer_path") or _config.get("tokenizer_path")
     if not tokenizer_path:
-        raise HTTPException(501, "Token counting requires tokenizer_path in config")
+        return {"input_tokens": 0}
     try:
         input_tokens = _count_tokens_in_openai_req(openai_req, tokenizer_path)
     except Exception as exc:

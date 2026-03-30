@@ -40,14 +40,48 @@ class ProviderError(Exception):
 class ProviderStream:
     """Async iterable yielding SSE lines from an established provider connection."""
 
-    def __init__(self, response: httpx.Response, client: httpx.AsyncClient):
+    def __init__(
+        self,
+        response: httpx.Response,
+        client: httpx.AsyncClient,
+        reconnect=None,
+        max_retries: int = 0,
+    ):
         self._response = response
         self._client = client
+        self._reconnect = reconnect
+        self._max_retries = max_retries
 
     async def __aiter__(self):
-        async for line in self._response.aiter_lines():
-            if line:
-                yield line.encode()
+        attempt = 0
+        yielded_any = False
+
+        while True:
+            try:
+                async for line in self._response.aiter_lines():
+                    if line:
+                        yielded_any = True
+                        yield line.encode()
+                return
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
+                can_retry = (
+                    not yielded_any
+                    and self._reconnect is not None
+                    and attempt < self._max_retries
+                )
+                if not can_retry:
+                    raise
+
+                attempt += 1
+                logger.warning(
+                    "Stream read error before first chunk (attempt %d/%d): %s",
+                    attempt,
+                    self._max_retries,
+                    exc,
+                )
+                await self.aclose()
+                await asyncio.sleep(1)
+                self._response, self._client = await self._reconnect()
 
     async def aiter_raw(self):
         async for chunk in self._response.aiter_raw():
@@ -113,19 +147,26 @@ async def open_provider_stream(
     """
     last_exc: Exception | None = None
 
+    async def _connect() -> tuple[httpx.Response, httpx.AsyncClient]:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(timeout), trust_env=False)
+        req = client.build_request("POST", url, headers=headers, json=body)
+        try:
+            resp = await client.send(req, stream=True)
+        except Exception:
+            await client.aclose()
+            raise
+        return resp, client
+
     for attempt in range(max_retries + 1):
         if attempt > 0:
             logger.warning("Stream retry %d/%d after sleep", attempt, max_retries)
             await asyncio.sleep(1)
 
-        client = httpx.AsyncClient(timeout=httpx.Timeout(timeout), trust_env=False)
         try:
-            req = client.build_request("POST", url, headers=headers, json=body)
-            resp = await client.send(req, stream=True)
+            resp, client = await _connect()
         except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
             last_exc = exc
             logger.warning("Stream connection error (attempt %d): %s", attempt + 1, exc)
-            await client.aclose()
             continue
 
         if resp.status_code in _RETRY_STATUSES and attempt < max_retries:
@@ -144,7 +185,12 @@ async def open_provider_stream(
             await client.aclose()
             raise ProviderError(resp.status_code, body_text.decode())
 
-        return ProviderStream(resp, client)
+        return ProviderStream(
+            resp,
+            client,
+            reconnect=_connect,
+            max_retries=max_retries,
+        )
 
     raise last_exc or ProviderError(0, "Unknown error after retries")
 

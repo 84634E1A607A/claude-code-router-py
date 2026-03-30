@@ -1,16 +1,16 @@
 {
   "PORT": 3456,
-  "API_TIMEOUT_MS": 120000,
+  "API_TIMEOUT_MS": 850000,
   "Providers": [
     {
       "name": "zai",
-      "api_base_url": "http://172.27.10.31:34567/v1/chat/completions",
+      "api_base_url": "http://172.27.10.137:34567/v1/chat/completions",
       "api_key": "sk-xxx",
       "max_retries": 3,
       "params": {
         "temperature": 1.0,
         "top_p": 1.0,
-        "max_tokens": 32768,
+        "max_tokens": 65536,
         "reasoning": {"budget_tokens": 10240}
       }
     }

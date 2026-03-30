@@ -13,6 +13,9 @@ import os
 import sys
 import unittest
 
+import httpx
+
+from client import ProviderStream
 from converter import anthropic_to_openai, openai_to_anthropic, stream_openai_to_anthropic
 from config import apply_provider_params, load_config, resolve_route, get_provider
 from batch import (
@@ -533,6 +536,72 @@ class TestStreamConverter(unittest.IsolatedAsyncioTestCase):
         types = [e["type"] for e in events]
         self.assertIn("message_start", types)
         self.assertIn("message_stop", types)
+
+
+class TestProviderStreamRetry(unittest.IsolatedAsyncioTestCase):
+
+    async def test_retry_before_first_chunk_on_remote_protocol_error(self):
+        class FakeResponse:
+            def __init__(self, events=None, exc=None):
+                self._events = events or []
+                self._exc = exc
+
+            async def aiter_lines(self):
+                if self._exc is not None:
+                    raise self._exc
+                for event in self._events:
+                    yield event
+
+            async def aclose(self):
+                return None
+
+        class FakeClient:
+            async def aclose(self):
+                return None
+
+        reconnect_calls = 0
+
+        async def reconnect():
+            nonlocal reconnect_calls
+            reconnect_calls += 1
+            return FakeResponse(events=["data: hello"]), FakeClient()
+
+        stream = ProviderStream(
+            FakeResponse(exc=httpx.RemoteProtocolError("incomplete chunked read")),
+            FakeClient(),
+            reconnect=reconnect,
+            max_retries=1,
+        )
+
+        got = [line async for line in stream]
+        self.assertEqual(got, [b"data: hello"])
+        self.assertEqual(reconnect_calls, 1)
+
+    async def test_no_retry_after_first_chunk(self):
+        class FakeResponse:
+            async def aiter_lines(self):
+                yield "data: hello"
+                raise httpx.RemoteProtocolError("incomplete chunked read")
+
+            async def aclose(self):
+                return None
+
+        class FakeClient:
+            async def aclose(self):
+                return None
+
+        stream = ProviderStream(
+            FakeResponse(),
+            FakeClient(),
+            reconnect=None,
+            max_retries=1,
+        )
+
+        got = []
+        with self.assertRaises(httpx.RemoteProtocolError):
+            async for line in stream:
+                got.append(line)
+        self.assertEqual(got, [b"data: hello"])
 
 
 # ============================================================================
@@ -1095,7 +1164,8 @@ if __name__ == "__main__":
 
     if mode in ("unit", "all"):
         for cls in (TestAnthropicToOpenAI, TestOpenAIToAnthropic,
-                    TestStreamConverter, TestConfig, TestApplyProviderParams,
+                    TestStreamConverter, TestProviderStreamRetry,
+                    TestConfig, TestApplyProviderParams,
                     TestBatchConversion, TestLegacyPromptParsing, TestURLHelpers):
             suite.addTests(loader.loadTestsFromTestCase(cls))
 
