@@ -15,7 +15,7 @@ Claude Code / any Anthropic client
 ## Quick Start
 
 ```bash
-pip install fastapi uvicorn gunicorn httpx
+pip install -r requirements.txt
 ```
 
 Point your Anthropic client at the proxy:
@@ -63,6 +63,12 @@ Alternatively via `main.py`:
 python main.py --config config.json --workers 32
 ```
 
+You can point the server at any config path with:
+
+```bash
+python main.py --config /path/to/config.json
+```
+
 ### Workers guideline
 
 Each worker is an independent process with its own asyncio event loop. A single worker already handles many concurrent streaming connections. Rule of thumb:
@@ -102,6 +108,46 @@ Each worker is an independent process with its own asyncio event loop. A single 
   }
 }
 ```
+
+### Example: SGLang backend with `dp=64`
+
+Use this when the upstream backend is SGLang and the SGLang server itself is running with `dp_size=64`.
+The router does not hardcode `64`; it discovers the live `dp_size` from the backend's `/get_server_info`
+endpoint and uses that to inject `routed_dp_rank`.
+
+```json
+{
+  "PORT": 3456,
+  "API_TIMEOUT_MS": 850000,
+  "Providers": [
+    {
+      "name": "sglang",
+      "api_base_url": "http://sglang-host:30000/v1/chat/completions",
+      "api_key": "$SGLANG_API_KEY",
+      "max_retries": 3,
+      "dp_routing": {
+        "enabled": true,
+        "server_info_ttl_sec": 30
+      },
+      "params": {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_tokens": 65536,
+        "reasoning": {"budget_tokens": 10240}
+      }
+    }
+  ],
+  "Router": {
+    "default": "sglang,/model"
+  }
+}
+```
+
+Notes:
+- `dp_routing.enabled: true` turns on `routed_dp_rank` injection for `/v1/messages`
+- `X-Claude-Code-Session-Id` is used as the sticky key when present
+- `X-Routed-DP-Rank` can be sent explicitly for testing
+- if the backend reports `dp_size <= 1`, the router does not inject `routed_dp_rank`
 
 ### Top-level fields
 
