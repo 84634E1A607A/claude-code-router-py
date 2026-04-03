@@ -224,16 +224,18 @@ def openai_to_anthropic(resp: dict, original_model: str) -> dict:
     if text:
         content.append({"type": "text", "text": text})
 
-    # Tool calls
+    # Tool calls — support both nested {"function": {"name", "arguments"}}
+    # and flat {"name", "arguments"} formats
     for tc in message.get("tool_calls") or []:
+        fn = tc.get("function") or tc  # flat fallback
         try:
-            input_obj = json.loads(tc["function"]["arguments"])
-        except (json.JSONDecodeError, KeyError, TypeError):
-            input_obj = {"_raw": tc["function"].get("arguments", "")}
+            input_obj = json.loads(fn.get("arguments", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            input_obj = {"_raw": fn.get("arguments", "")}
         content.append({
             "type": "tool_use",
-            "id": tc["id"],
-            "name": tc["function"]["name"],
+            "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
+            "name": fn.get("name", ""),
             "input": input_obj,
         })
 
@@ -427,7 +429,8 @@ async def stream_openai_to_anthropic(
                 block_idx = content_index
                 content_index += 1
                 tc_id = tc_delta.get("id", f"toolu_{uuid.uuid4().hex[:24]}")
-                tc_name = (tc_delta.get("function") or {}).get("name", "")
+                tc_fn = tc_delta.get("function") or tc_delta  # flat fallback
+                tc_name = tc_fn.get("name", "")
                 tool_blocks[tc_idx] = {
                     "block_idx": block_idx,
                     "id": tc_id,
@@ -444,7 +447,8 @@ async def stream_openai_to_anthropic(
                     },
                 })
 
-            args = (tc_delta.get("function") or {}).get("arguments", "")
+            tc_fn_d = tc_delta.get("function") or tc_delta  # flat fallback
+            args = tc_fn_d.get("arguments", "")
             if args:
                 yield _sse("content_block_delta", {
                     "type": "content_block_delta",
