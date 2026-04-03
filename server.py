@@ -4,15 +4,19 @@ to an OpenAI-compatible provider, converting formats in both directions.
 """
 
 import json
+import hashlib
 import logging
 import os
+import re
+import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import AsyncIterator
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from batch import anthropic_batch_to_openai_jsonl, openai_batch_to_anthropic, openai_results_line_to_anthropic
 from client import ProviderError, ProviderStream, close_shared_client, get_shared_client, open_provider_stream, post_json
@@ -24,11 +28,34 @@ logger = logging.getLogger(__name__)
 
 # Populated either by set_config() (single-process) or lifespan (multi-worker).
 _config: dict = {}
+_dp_size_cache: dict[str, dict[str, float | int]] = {}
+
+_CLAUDE_SESSION_HEADER = "X-Claude-Code-Session-Id"
+_DP_OVERRIDE_HEADER = "X-Routed-DP-Rank"
+_DP_SERVER_INFO_TTL_SEC = 30
+_INVALID_DP_RANK_RE = re.compile(r"routed_dp_rank.*out of range", re.IGNORECASE | re.DOTALL)
+
+
+@dataclass
+class DPRoutingDecision:
+    dp_size: int | None = None
+    rank: int | None = None
+    source: str | None = None
+    sticky_key: str | None = None
+
+    def response_headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        if self.rank is not None:
+            headers["X-Router-DP-Rank"] = str(self.rank)
+        if self.source == "session" and self.sticky_key:
+            headers["X-Router-Sticky-Key"] = self.sticky_key
+        return headers
 
 
 def set_config(cfg: dict) -> None:
     global _config
     _config = cfg
+    _dp_size_cache.clear()
 
 
 def _build_config_from_env() -> dict | None:
@@ -54,6 +81,11 @@ def _build_config_from_env() -> dict | None:
         "api_key": os.environ.get("CCR_API_KEY") or os.environ.get("API_KEY", ""),
         "max_retries": int(os.environ.get("CCR_MAX_RETRIES", "3")),
     }
+    if os.environ.get("CCR_DP_ROUTING_ENABLED", "").strip().lower() in ("1", "true", "yes"):
+        provider["dp_routing"] = {
+            "enabled": True,
+            "server_info_ttl_sec": int(os.environ.get("CCR_DP_SERVER_INFO_TTL_SEC", str(_DP_SERVER_INFO_TTL_SEC))),
+        }
     if params:
         provider["params"] = params
 
@@ -148,6 +180,160 @@ def _files_url(provider: dict) -> str:
     return _api_base(provider) + "/files"
 
 
+def _dp_routing_config(provider: dict) -> dict | None:
+    cfg = provider.get("dp_routing")
+    if not isinstance(cfg, dict) or not cfg.get("enabled"):
+        return None
+    return cfg
+
+
+def _dp_cache_key(provider: dict) -> str:
+    return f"{provider.get('name', '')}:{provider.get('api_base_url', '')}"
+
+
+def _dp_server_info_url(provider: dict) -> str:
+    api_base = _api_base(provider).rstrip("/")
+    root = api_base.removesuffix("/v1").removesuffix("/")
+    return f"{root}/get_server_info"
+
+
+def _dp_server_info_ttl(provider: dict) -> int:
+    cfg = _dp_routing_config(provider) or {}
+    ttl = cfg.get("server_info_ttl_sec", _DP_SERVER_INFO_TTL_SEC)
+    try:
+        return max(int(ttl), 1)
+    except (TypeError, ValueError):
+        return _DP_SERVER_INFO_TTL_SEC
+
+
+async def _get_provider_dp_size(provider: dict, force_refresh: bool = False) -> int | None:
+    if _dp_routing_config(provider) is None:
+        return None
+
+    cache_key = _dp_cache_key(provider)
+    now = time.monotonic()
+    cached = _dp_size_cache.get(cache_key)
+    ttl = _dp_server_info_ttl(provider)
+    if cached and not force_refresh and now - float(cached["fetched_at"]) < ttl:
+        return int(cached["dp_size"])
+
+    url = _dp_server_info_url(provider)
+    client = get_shared_client()
+    timeout = _timeout()
+    try:
+        resp = await client.get(url, headers=_provider_headers(provider), timeout=timeout)
+        if resp.status_code >= 400:
+            _dp_size_cache.pop(cache_key, None)
+            logger.warning("DP routing disabled for %s: /get_server_info returned %d", provider.get("name"), resp.status_code)
+            return None
+        data = resp.json()
+        dp_size = int(data["dp_size"])
+        if dp_size < 0:
+            raise ValueError("dp_size must be non-negative")
+    except Exception as exc:
+        _dp_size_cache.pop(cache_key, None)
+        logger.warning("DP routing disabled for %s: failed to fetch /get_server_info: %s", provider.get("name"), exc)
+        return None
+
+    _dp_size_cache[cache_key] = {"dp_size": dp_size, "fetched_at": now}
+    return dp_size
+
+
+def _rendezvous_rank(sticky_key: str, dp_size: int) -> int:
+    best_rank = 0
+    best_score: bytes | None = None
+    sticky_key_bytes = sticky_key.encode("utf-8", "surrogatepass")
+    for rank in range(dp_size):
+        digest = hashlib.sha256()
+        digest.update(sticky_key_bytes)
+        digest.update(b"\0")
+        digest.update(str(rank).encode("ascii"))
+        score = digest.digest()
+        if best_score is None or score > best_score:
+            best_score = score
+            best_rank = rank
+    return best_rank
+
+
+def _is_invalid_dp_rank_error(exc: ProviderError) -> bool:
+    if not exc.body:
+        return False
+    return bool(_INVALID_DP_RANK_RE.search(exc.body))
+
+
+def _log_dp_routing(provider: dict, decision: DPRoutingDecision, remapped: bool = False) -> None:
+    if decision.rank is None:
+        return
+    logger.info(
+        "DP routing provider=%s dp_size=%s rank=%s source=%s sticky_key=%s remapped=%s",
+        provider.get("name"),
+        decision.dp_size,
+        decision.rank,
+        decision.source,
+        decision.sticky_key,
+        remapped,
+    )
+
+
+async def _resolve_dp_routing(
+    request: Request,
+    provider: dict,
+    base_openai_req: dict,
+    force_refresh: bool = False,
+) -> tuple[dict, DPRoutingDecision]:
+    openai_req = dict(base_openai_req)
+    if _dp_routing_config(provider) is None:
+        return openai_req, DPRoutingDecision()
+
+    dp_size = await _get_provider_dp_size(provider, force_refresh=force_refresh)
+    decision = DPRoutingDecision(dp_size=dp_size)
+    if dp_size is None or dp_size <= 1:
+        return openai_req, decision
+
+    override_rank = request.headers.get(_DP_OVERRIDE_HEADER)
+    if override_rank is not None:
+        try:
+            rank = int(override_rank.strip())
+        except ValueError:
+            raise HTTPException(400, f"{_DP_OVERRIDE_HEADER} must be an integer")
+        if rank < 0 or rank >= dp_size:
+            raise HTTPException(400, f"{_DP_OVERRIDE_HEADER} must be in range [0, {dp_size})")
+        openai_req["routed_dp_rank"] = rank
+        decision.rank = rank
+        decision.source = "override"
+        return openai_req, decision
+
+    sticky_key = request.headers.get(_CLAUDE_SESSION_HEADER)
+    if not sticky_key:
+        return openai_req, decision
+
+    rank = _rendezvous_rank(sticky_key, dp_size)
+    openai_req["routed_dp_rank"] = rank
+    decision.rank = rank
+    decision.source = "session"
+    decision.sticky_key = sticky_key
+    return openai_req, decision
+
+
+async def _retry_message_request_for_invalid_rank(
+    request: Request,
+    provider: dict,
+    base_openai_req: dict,
+    old_decision: DPRoutingDecision,
+) -> tuple[dict, DPRoutingDecision]:
+    openai_req, new_decision = await _resolve_dp_routing(
+        request,
+        provider,
+        base_openai_req,
+        force_refresh=True,
+    )
+    if old_decision.source == "override" and (new_decision.dp_size or 0) > 1 and new_decision.rank is None:
+        raise HTTPException(400, f"{_DP_OVERRIDE_HEADER} must be in range [0, {new_decision.dp_size})")
+    _log_dp_routing(provider, new_decision, remapped=(new_decision.rank != old_decision.rank))
+    log_openai_request(openai_req)
+    return openai_req, new_decision
+
+
 _tokenizer_cache: dict[str, object] = {}  # tokenizer_path → tokenizer
 
 
@@ -210,8 +396,10 @@ async def messages(request: Request):
     body["model"] = model
 
     # Anthropic → OpenAI, then apply provider param defaults
-    openai_req = anthropic_to_openai(body)
-    openai_req = apply_provider_params(provider, openai_req)
+    base_openai_req = anthropic_to_openai(body)
+    base_openai_req = apply_provider_params(provider, base_openai_req)
+    openai_req, dp_decision = await _resolve_dp_routing(request, provider, base_openai_req)
+    _log_dp_routing(provider, dp_decision)
     log_openai_request(openai_req)
 
     headers = _provider_headers(provider)
@@ -225,7 +413,19 @@ async def messages(request: Request):
         try:
             stream = await open_provider_stream(url, headers, openai_req, timeout, max_retries)
         except ProviderError as exc:
-            raise HTTPException(exc.status or 502, exc.body or str(exc))
+            if _is_invalid_dp_rank_error(exc) and dp_decision.rank is not None:
+                openai_req, dp_decision = await _retry_message_request_for_invalid_rank(
+                    request,
+                    provider,
+                    base_openai_req,
+                    dp_decision,
+                )
+                try:
+                    stream = await open_provider_stream(url, headers, openai_req, timeout, max_retries)
+                except ProviderError as retry_exc:
+                    raise HTTPException(retry_exc.status or 502, retry_exc.body or str(retry_exc))
+            else:
+                raise HTTPException(exc.status or 502, exc.body or str(exc))
         except Exception as exc:
             logger.exception("Stream connection error")
             raise HTTPException(502, str(exc))
@@ -236,6 +436,7 @@ async def messages(request: Request):
             headers={
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
+                **dp_decision.response_headers(),
             },
         )
 
@@ -245,15 +446,30 @@ async def messages(request: Request):
             url, headers, openai_req, timeout=timeout, max_retries=max_retries
         )
     except ProviderError as exc:
-        logger.error("Provider error: %s", exc)
-        raise HTTPException(exc.status or 502, exc.body or str(exc))
+        if _is_invalid_dp_rank_error(exc) and dp_decision.rank is not None:
+            openai_req, dp_decision = await _retry_message_request_for_invalid_rank(
+                request,
+                provider,
+                base_openai_req,
+                dp_decision,
+            )
+            try:
+                openai_resp = await post_json(
+                    url, headers, openai_req, timeout=timeout, max_retries=max_retries
+                )
+            except ProviderError as retry_exc:
+                logger.error("Provider error after DP refresh: %s", retry_exc)
+                raise HTTPException(retry_exc.status or 502, retry_exc.body or str(retry_exc))
+        else:
+            logger.error("Provider error: %s", exc)
+            raise HTTPException(exc.status or 502, exc.body or str(exc))
     except Exception as exc:
         logger.exception("Unexpected error calling provider")
         raise HTTPException(502, str(exc))
 
     check_and_save_nonstreaming(openai_req, openai_resp)
     anthropic_resp = openai_to_anthropic(openai_resp, model)
-    return anthropic_resp
+    return JSONResponse(content=anthropic_resp, headers=dp_decision.response_headers())
 
 
 async def _stream_response(

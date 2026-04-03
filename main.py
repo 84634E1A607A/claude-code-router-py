@@ -30,6 +30,11 @@ def _build_config(args: argparse.Namespace) -> dict:
         "api_key": args.api_key or os.environ.get("API_KEY", ""),
         "max_retries": args.max_retries,
     }
+    if args.dp_routing:
+        provider["dp_routing"] = {
+            "enabled": True,
+            "server_info_ttl_sec": args.dp_server_info_ttl_sec,
+        }
     if params:
         provider["params"] = params
 
@@ -56,6 +61,10 @@ def main() -> None:
     parser.add_argument("--model", default="/model", metavar="MODEL",
                         help="Model name/path forwarded to the provider")
     parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--dp-routing", action="store_true",
+                        help="Enable SGLang DP-rank pinning for /v1/messages")
+    parser.add_argument("--dp-server-info-ttl-sec", type=int, default=30,
+                        help="TTL for cached /get_server_info dp_size lookups")
 
     # ── Provider params ───────────────────────────────────────────────────────
     parser.add_argument("--temperature", type=float, default=None)

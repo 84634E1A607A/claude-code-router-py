@@ -85,6 +85,10 @@ Each worker is an independent process with its own asyncio event loop. A single 
       "api_base_url": "http://your-openai-endpoint/v1/chat/completions",
       "api_key": "$MY_API_KEY",
       "max_retries": 3,
+      "dp_routing": {
+        "enabled": true,
+        "server_info_ttl_sec": 30
+      },
       "params": {
         "temperature": 1.0,
         "top_p": 1.0,
@@ -116,7 +120,36 @@ Each worker is an independent process with its own asyncio event loop. A single 
 | `api_base_url` | yes | Full URL of the OpenAI-compatible endpoint (e.g. `.../v1/chat/completions`) |
 | `api_key` | yes | API key sent as `Authorization: Bearer <key>` |
 | `max_retries` | no | Retries on 429/5xx (default `3`) |
+| `dp_routing` | no | SGLang-only DP rank pinning config (see below) |
 | `params` | no | Parameter defaults/overrides (see below) |
+
+### `dp_routing` — SGLang DP rank pinning
+
+Optional provider block for routing one Claude Code session to one SGLang DP worker.
+
+| Field | Description |
+|---|---|
+| `enabled` | Enable SGLang DP rank discovery and `routed_dp_rank` injection for `/v1/messages` |
+| `server_info_ttl_sec` | Cache TTL for `/get_server_info` lookups (default `30`) |
+
+When enabled, the router:
+- fetches `dp_size` from the backend's `/get_server_info`
+- injects `routed_dp_rank` only when `dp_size > 1`
+- uses `X-Claude-Code-Session-Id` for sticky session hashing
+- honors `X-Routed-DP-Rank` as a manual override
+
+CLI / env equivalents:
+- `python main.py ... --dp-routing --dp-server-info-ttl-sec 30`
+- `CCR_DP_ROUTING_ENABLED=1`
+- `CCR_DP_SERVER_INFO_TTL_SEC=30`
+
+Request headers:
+- `X-Claude-Code-Session-Id`: opaque session key used for sticky DP-rank selection
+- `X-Routed-DP-Rank`: explicit rank override for testing
+
+Response headers when pinning is active:
+- `X-Router-DP-Rank`
+- `X-Router-Sticky-Key` (session-based routing only)
 
 ### `params` — provider-level parameter overrides
 

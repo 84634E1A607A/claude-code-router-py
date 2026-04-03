@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import unittest
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -861,6 +862,386 @@ class TestURLHelpers(unittest.TestCase):
         from server import _batches_url
         p = self._prov("http://host:8000/v1/models")
         self.assertEqual(_batches_url(p), "http://host:8000/v1/batches")
+
+
+# ============================================================================
+# Unit — DP routing
+# ============================================================================
+
+class TestDPRoutingHelpers(unittest.IsolatedAsyncioTestCase):
+
+    async def test_get_provider_dp_size_uses_cache(self):
+        import server as srv_mod
+
+        class FakeResponse:
+            def __init__(self, data):
+                self.status_code = 200
+                self._data = data
+                self.text = json.dumps(data)
+
+            def json(self):
+                return self._data
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def get(self, url, headers=None, timeout=None):
+                self.calls.append((url, headers, timeout))
+                return FakeResponse({"dp_size": 4})
+
+        srv_mod.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [{
+                "name": "sglang",
+                "api_base_url": "http://host:8000/v1/chat/completions",
+                "api_key": "k",
+                "dp_routing": {"enabled": True, "server_info_ttl_sec": 30},
+            }],
+            "Router": {"default": "sglang,/model"},
+        })
+        provider = srv_mod.get_provider(srv_mod._config, "sglang")
+        fake_client = FakeClient()
+
+        with patch.object(srv_mod, "get_shared_client", return_value=fake_client):
+            first = await srv_mod._get_provider_dp_size(provider)
+            second = await srv_mod._get_provider_dp_size(provider)
+
+        self.assertEqual(first, 4)
+        self.assertEqual(second, 4)
+        self.assertEqual(len(fake_client.calls), 1)
+        self.assertEqual(fake_client.calls[0][0], "http://host:8000/get_server_info")
+
+    def test_rendezvous_rank_is_stable(self):
+        import server as srv_mod
+
+        rank_one = srv_mod._rendezvous_rank("session-abc", 4)
+        rank_two = srv_mod._rendezvous_rank("session-abc", 4)
+        self.assertEqual(rank_one, rank_two)
+
+
+class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
+
+    async def asyncSetUp(self):
+        import server as srv_mod
+
+        self.srv = srv_mod
+        srv_mod.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [{
+                "name": "sglang",
+                "api_base_url": "http://host:8000/v1/chat/completions",
+                "api_key": "k",
+                "max_retries": 1,
+                "dp_routing": {"enabled": True, "server_info_ttl_sec": 30},
+            }],
+            "Router": {"default": "sglang,/model"},
+        })
+
+        from httpx import ASGITransport, AsyncClient
+        self.client = AsyncClient(
+            transport=ASGITransport(app=srv_mod.app),
+            base_url="http://test",
+            timeout=60.0,
+        )
+
+    async def asyncTearDown(self):
+        await self.client.aclose()
+        self.srv.set_config({})
+
+    def _messages_req(self, extra=None):
+        req = {
+            "model": "ignored",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "Reply with exactly: PONG"}],
+        }
+        if extra:
+            req.update(extra)
+        return req
+
+    def _openai_resp(self, text="PONG"):
+        return {
+            "id": "chatcmpl-test",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1},
+        }
+
+    def _session_key_with_changed_rank(self, old_dp_size, new_dp_size):
+        for idx in range(2048):
+            candidate = f"session-{idx}"
+            if self.srv._rendezvous_rank(candidate, old_dp_size) != self.srv._rendezvous_rank(candidate, new_dp_size):
+                return candidate
+        self.fail("No session key changed rank across DP sizes")
+
+    async def test_messages_injects_session_rank_and_response_headers(self):
+        sent_bodies = []
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_bodies.append(dict(body))
+            return self._openai_resp()
+
+        session_id = "session-sticky"
+        expected_rank = self.srv._rendezvous_rank(session_id, 4)
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._CLAUDE_SESSION_HEADER: session_id},
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(sent_bodies[0]["routed_dp_rank"], expected_rank)
+        self.assertEqual(resp.headers["X-Router-DP-Rank"], str(expected_rank))
+        self.assertEqual(resp.headers["X-Router-Sticky-Key"], session_id)
+
+    async def test_messages_without_sticky_headers_do_not_inject_rank(self):
+        sent_bodies = []
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_bodies.append(dict(body))
+            return self._openai_resp()
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            resp = await self.client.post("/v1/messages", json=self._messages_req())
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertNotIn("routed_dp_rank", sent_bodies[0])
+        self.assertNotIn("X-Router-DP-Rank", resp.headers)
+
+    async def test_dp_routing_disabled_leaves_request_unmodified(self):
+        sent_bodies = []
+        self.srv.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [{
+                "name": "sglang",
+                "api_base_url": "http://host:8000/v1/chat/completions",
+                "api_key": "k",
+                "max_retries": 1,
+            }],
+            "Router": {"default": "sglang,/model"},
+        })
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_bodies.append(dict(body))
+            return self._openai_resp()
+
+        fake_dp_size = AsyncMock(return_value=4)
+        with patch.object(self.srv, "_get_provider_dp_size", new=fake_dp_size), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._CLAUDE_SESSION_HEADER: "session-sticky"},
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertNotIn("routed_dp_rank", sent_bodies[0])
+        self.assertNotIn("X-Router-DP-Rank", resp.headers)
+        fake_dp_size.assert_not_awaited()
+
+    async def test_override_header_wins_over_session_hash(self):
+        sent_bodies = []
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_bodies.append(dict(body))
+            return self._openai_resp()
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={
+                    self.srv._CLAUDE_SESSION_HEADER: "session-sticky",
+                    self.srv._DP_OVERRIDE_HEADER: "2",
+                },
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(sent_bodies[0]["routed_dp_rank"], 2)
+        self.assertEqual(resp.headers["X-Router-DP-Rank"], "2")
+        self.assertNotIn("X-Router-Sticky-Key", resp.headers)
+
+    async def test_invalid_override_header_returns_400(self):
+        fake_post = AsyncMock()
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
+             patch.object(self.srv, "post_json", new=fake_post):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._DP_OVERRIDE_HEADER: "not-an-int"},
+            )
+
+        self.assertEqual(resp.status_code, 400)
+        fake_post.assert_not_awaited()
+
+    async def test_out_of_range_override_returns_400(self):
+        fake_post = AsyncMock()
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
+             patch.object(self.srv, "post_json", new=fake_post):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._DP_OVERRIDE_HEADER: "4"},
+            )
+
+        self.assertEqual(resp.status_code, 400)
+        fake_post.assert_not_awaited()
+
+    async def test_dp_size_one_skips_rank_injection(self):
+        sent_bodies = []
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_bodies.append(dict(body))
+            return self._openai_resp()
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=1)), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={
+                    self.srv._CLAUDE_SESSION_HEADER: "session-sticky",
+                    self.srv._DP_OVERRIDE_HEADER: "0",
+                },
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertNotIn("routed_dp_rank", sent_bodies[0])
+        self.assertNotIn("X-Router-DP-Rank", resp.headers)
+
+    async def test_streaming_messages_inject_rank_and_headers(self):
+        sent_bodies = []
+
+        class FakeProviderStream:
+            def __init__(self, lines):
+                self._lines = lines
+
+            async def __aiter__(self):
+                for line in self._lines:
+                    yield line.encode()
+
+            async def aclose(self):
+                return None
+
+        stream_lines = [
+            "data: " + json.dumps({
+                "id": "x",
+                "choices": [{"index": 0, "delta": {"content": "PONG"}, "finish_reason": None}],
+            }),
+            "data: " + json.dumps({
+                "id": "x",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1},
+            }),
+            "data: [DONE]",
+        ]
+
+        async def fake_open_stream(url, headers, body, timeout=600.0, max_retries=3):
+            sent_bodies.append(dict(body))
+            return FakeProviderStream(stream_lines)
+
+        session_id = "stream-session"
+        expected_rank = self.srv._rendezvous_rank(session_id, 4)
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
+             patch.object(self.srv, "open_provider_stream", new=AsyncMock(side_effect=fake_open_stream)):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req({"stream": True}),
+                headers={
+                    "Accept": "text/event-stream",
+                    self.srv._CLAUDE_SESSION_HEADER: session_id,
+                },
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(sent_bodies[0]["routed_dp_rank"], expected_rank)
+        self.assertEqual(resp.headers["X-Router-DP-Rank"], str(expected_rank))
+        self.assertIn("message_start", resp.text)
+
+    async def test_invalid_rank_retries_once_with_refreshed_dp_size(self):
+        sent_bodies = []
+        session_id = self._session_key_with_changed_rank(4, 2)
+        first_rank = self.srv._rendezvous_rank(session_id, 4)
+        second_rank = self.srv._rendezvous_rank(session_id, 2)
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_bodies.append(dict(body))
+            if len(sent_bodies) == 1:
+                raise self.srv.ProviderError(
+                    400,
+                    f"ValueError: routed_dp_rank={body['routed_dp_rank']} out of range [0, 2)",
+                )
+            return self._openai_resp()
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(side_effect=[4, 2])), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._CLAUDE_SESSION_HEADER: session_id},
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(len(sent_bodies), 2)
+        self.assertEqual(sent_bodies[0]["routed_dp_rank"], first_rank)
+        self.assertEqual(sent_bodies[1]["routed_dp_rank"], second_rank)
+        self.assertEqual(resp.headers["X-Router-DP-Rank"], str(second_rank))
+
+    async def test_override_invalid_after_refresh_returns_400_without_remap(self):
+        sent_bodies = []
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_bodies.append(dict(body))
+            raise self.srv.ProviderError(
+                400,
+                f"ValueError: routed_dp_rank={body['routed_dp_rank']} out of range [0, 2)",
+            )
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(side_effect=[4, 2])), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._DP_OVERRIDE_HEADER: "3"},
+            )
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(len(sent_bodies), 1)
+        self.assertEqual(sent_bodies[0]["routed_dp_rank"], 3)
+
+    async def test_legacy_complete_does_not_use_dp_routing(self):
+        sent_bodies = []
+        fake_dp_size = AsyncMock(return_value=4)
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_bodies.append(dict(body))
+            return self._openai_resp()
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=fake_dp_size), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            resp = await self.client.post(
+                "/v1/complete",
+                json={
+                    "model": "ignored",
+                    "prompt": "\n\nHuman: Reply with exactly: PONG\n\nAssistant:",
+                    "max_tokens_to_sample": 32,
+                },
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertNotIn("routed_dp_rank", sent_bodies[0])
+        fake_dp_size.assert_not_awaited()
 
 
 # ============================================================================
