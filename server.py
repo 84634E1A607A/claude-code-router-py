@@ -11,7 +11,7 @@ import re
 import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import AsyncIterator
 
 import httpx
@@ -52,10 +52,122 @@ class DPRoutingDecision:
         return headers
 
 
+@dataclass
+class DPAllocator:
+    """Manages session-to-DP-rank mapping with round-robin allocation.
+
+    Key properties:
+    - Sessions are sticky forever (once assigned, never reassigned)
+    - Multiple sessions can share the same DP rank
+    - New sessions get the DP rank with longest idle time
+    - Sessions evicted after TTL of inactivity
+    """
+    dp_size: int
+    ttl_sec: float = 10800.0  # 3 hours default
+    sessions: dict[str, int] = field(default_factory=dict)  # session_id -> dp_rank
+    rank_last_used: dict[int, float] = field(default_factory=dict)  # dp_rank -> timestamp
+    session_activity: dict[str, float] = field(default_factory=dict)  # session_id -> timestamp
+
+    def assign(self, session_id: str) -> tuple[int, bool]:
+        """Assign a DP rank to a session.
+
+        Returns (rank, is_new) where is_new is True if this was a new assignment.
+        Performs lazy cleanup of expired sessions before assigning a new one.
+        """
+        now = time.monotonic()
+
+        # Check if session already has a rank (sticky forever)
+        if session_id in self.sessions:
+            rank = self.sessions[session_id]
+            self.session_activity[session_id] = now
+            return rank, False
+
+        # Lazy cleanup: evict expired sessions before assigning a new one
+        evicted = self._cleanup(now)
+        if evicted > 0:
+            logger.debug("DP lazy cleanup: evicted=%d sessions remaining=%d", evicted, len(self.sessions))
+
+        # Find the best rank for new session
+        rank = self._select_rank()
+
+        # Record the assignment
+        self.sessions[session_id] = rank
+        self.rank_last_used[rank] = now
+        self.session_activity[session_id] = now
+
+        return rank, True
+
+    def _cleanup(self, now: float) -> int:
+        """Evict sessions inactive for > TTL. Returns count of evicted sessions."""
+        to_evict = [
+            sid for sid, last_active in self.session_activity.items()
+            if now - last_active > self.ttl_sec
+        ]
+
+        for sid in to_evict:
+            self.sessions.pop(sid, None)
+            self.session_activity.pop(sid, None)
+            # Note: we don't remove from rank_last_used - that tracks DP usage history
+
+        return len(to_evict)
+
+    def _select_rank(self) -> int:
+        """Select the best DP rank for a new session."""
+        # If not all ranks have been used, pick the next unused one (round-robin)
+        used_ranks = set(self.rank_last_used.keys())
+        if len(used_ranks) < self.dp_size:
+            for r in range(self.dp_size):
+                if r not in used_ranks:
+                    return r
+
+        # All ranks have been used, pick the one with longest idle time
+        oldest_time = None
+        oldest_rank = 0
+        for r in range(self.dp_size):
+            last_used = self.rank_last_used.get(r, 0.0)
+            if oldest_time is None or last_used < oldest_time:
+                oldest_time = last_used
+                oldest_rank = r
+        return oldest_rank
+
+    def cleanup(self) -> int:
+        """Public cleanup method for external use. Evicts expired sessions."""
+        return self._cleanup(time.monotonic())
+
+    def stats(self) -> dict:
+        """Return allocation statistics for logging/debugging."""
+        rank_session_counts: dict[int, int] = {}
+        for rank in self.sessions.values():
+            rank_session_counts[rank] = rank_session_counts.get(rank, 0) + 1
+        return {
+            "dp_size": self.dp_size,
+            "total_sessions": len(self.sessions),
+            "ranks_in_use": len(rank_session_counts),
+            "sessions_per_rank": rank_session_counts,
+        }
+
+
+# Global allocator state per provider
+_dp_allocators: dict[str, DPAllocator] = {}
+
+
+def _get_session_ttl(provider: dict) -> float:
+    """Get session TTL from provider config, default 3 hours."""
+    cfg = provider.get("dp_routing")
+    if not isinstance(cfg, dict):
+        return 10800.0
+    ttl = cfg.get("session_ttl_sec", 10800.0)
+    try:
+        return max(float(ttl), 60.0)  # minimum 1 minute
+    except (TypeError, ValueError):
+        return 10800.0
+
+
 def set_config(cfg: dict) -> None:
     global _config
     _config = cfg
     _dp_size_cache.clear()
+    _dp_allocators.clear()
 
 
 def _build_config_from_env() -> dict | None:
@@ -82,10 +194,13 @@ def _build_config_from_env() -> dict | None:
         "max_retries": int(os.environ.get("CCR_MAX_RETRIES", "3")),
     }
     if os.environ.get("CCR_DP_ROUTING_ENABLED", "").strip().lower() in ("1", "true", "yes"):
-        provider["dp_routing"] = {
+        dp_routing_cfg: dict = {
             "enabled": True,
             "server_info_ttl_sec": int(os.environ.get("CCR_DP_SERVER_INFO_TTL_SEC", str(_DP_SERVER_INFO_TTL_SEC))),
         }
+        if (v := os.environ.get("CCR_DP_SESSION_TTL_SEC")) is not None:
+            dp_routing_cfg["session_ttl_sec"] = float(v)
+        provider["dp_routing"] = dp_routing_cfg
     if params:
         provider["params"] = params
 
@@ -215,7 +330,21 @@ async def _get_provider_dp_size(provider: dict, force_refresh: bool = False) -> 
     cached = _dp_size_cache.get(cache_key)
     ttl = _dp_server_info_ttl(provider)
     if cached and not force_refresh and now - float(cached["fetched_at"]) < ttl:
-        return int(cached["dp_size"])
+        dp_size = int(cached["dp_size"])
+        logger.debug(
+            "DP size cache hit: provider=%s dp_size=%d age=%.1fs ttl=%ds",
+            provider.get("name"),
+            dp_size,
+            now - float(cached["fetched_at"]),
+            ttl,
+        )
+        return dp_size
+
+    logger.debug(
+        "DP size cache miss: provider=%s force_refresh=%s",
+        provider.get("name"),
+        force_refresh,
+    )
 
     url = _dp_server_info_url(provider)
     client = get_shared_client()
@@ -236,10 +365,32 @@ async def _get_provider_dp_size(provider: dict, force_refresh: bool = False) -> 
         return None
 
     _dp_size_cache[cache_key] = {"dp_size": dp_size, "fetched_at": now}
+    logger.info("DP size fetched: provider=%s dp_size=%d", provider.get("name"), dp_size)
     return dp_size
 
 
+def _get_or_create_allocator(provider: dict, dp_size: int) -> DPAllocator:
+    """Get or create a DPAllocator for the given provider."""
+    cache_key = _dp_cache_key(provider)
+    allocator = _dp_allocators.get(cache_key)
+    if allocator is None or allocator.dp_size != dp_size:
+        ttl = _get_session_ttl(provider)
+        allocator = DPAllocator(dp_size=dp_size, ttl_sec=ttl)
+        _dp_allocators[cache_key] = allocator
+        logger.info(
+            "Created DP allocator for provider=%s dp_size=%d ttl_sec=%.0f",
+            provider.get("name"),
+            dp_size,
+            ttl,
+        )
+    return allocator
+
+
 def _rendezvous_rank(sticky_key: str, dp_size: int) -> int:
+    """Deprecated: Use DPAllocator.assign() instead.
+
+    Kept for backward compatibility with existing tests.
+    """
     best_rank = 0
     best_score: bytes | None = None
     sticky_key_bytes = sticky_key.encode("utf-8", "surrogatepass")
@@ -303,15 +454,28 @@ async def _resolve_dp_routing(
         decision.source = "override"
         return openai_req, decision
 
+    # Get or generate session ID
     sticky_key = request.headers.get(_CLAUDE_SESSION_HEADER)
     if not sticky_key:
-        return openai_req, decision
+        sticky_key = str(uuid.uuid4())
 
-    rank = _rendezvous_rank(sticky_key, dp_size)
+    # Use allocator for round-robin assignment (with lazy cleanup)
+    allocator = _get_or_create_allocator(provider, dp_size)
+    rank, is_new = allocator.assign(sticky_key)
     openai_req["routed_dp_rank"] = rank
     decision.rank = rank
     decision.source = "session"
     decision.sticky_key = sticky_key
+
+    # Log session assignment
+    logger.info(
+        "DP assign: session=%s rank=%d is_new=%s total_sessions=%d",
+        sticky_key[:8] + "..." if len(sticky_key) > 8 else sticky_key,
+        rank,
+        is_new,
+        len(allocator.sessions),
+    )
+
     return openai_req, decision
 
 

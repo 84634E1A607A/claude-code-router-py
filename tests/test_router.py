@@ -970,13 +970,6 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
             "usage": {"prompt_tokens": 10, "completion_tokens": 1},
         }
 
-    def _session_key_with_changed_rank(self, old_dp_size, new_dp_size):
-        for idx in range(2048):
-            candidate = f"session-{idx}"
-            if self.srv._rendezvous_rank(candidate, old_dp_size) != self.srv._rendezvous_rank(candidate, new_dp_size):
-                return candidate
-        self.fail("No session key changed rank across DP sizes")
-
     async def test_messages_injects_session_rank_and_response_headers(self):
         sent_bodies = []
 
@@ -985,7 +978,8 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
             return self._openai_resp()
 
         session_id = "session-sticky"
-        expected_rank = self.srv._rendezvous_rank(session_id, 4)
+        # With round-robin allocator, first session gets rank 0
+        expected_rank = 0
 
         with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
              patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
@@ -1000,7 +994,8 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.headers["X-Router-DP-Rank"], str(expected_rank))
         self.assertEqual(resp.headers["X-Router-Sticky-Key"], session_id)
 
-    async def test_messages_without_sticky_headers_do_not_inject_rank(self):
+    async def test_messages_without_sticky_headers_gets_generated_session(self):
+        """When no session header is provided, a UUID is generated and DP routing still happens."""
         sent_bodies = []
 
         async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
@@ -1012,8 +1007,11 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
             resp = await self.client.post("/v1/messages", json=self._messages_req())
 
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertNotIn("routed_dp_rank", sent_bodies[0])
-        self.assertNotIn("X-Router-DP-Rank", resp.headers)
+        # New behavior: DP routing happens even without session header
+        self.assertIn("routed_dp_rank", sent_bodies[0])
+        self.assertIn("X-Router-DP-Rank", resp.headers)
+        # A sticky key should be generated
+        self.assertIn("X-Router-Sticky-Key", resp.headers)
 
     async def test_dp_routing_disabled_leaves_request_unmodified(self):
         sent_bodies = []
@@ -1151,7 +1149,8 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
             return FakeProviderStream(stream_lines)
 
         session_id = "stream-session"
-        expected_rank = self.srv._rendezvous_rank(session_id, 4)
+        # With round-robin allocator, first session gets rank 0
+        expected_rank = 0
 
         with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
              patch.object(self.srv, "open_provider_stream", new=AsyncMock(side_effect=fake_open_stream)):
@@ -1170,10 +1169,21 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         self.assertIn("message_start", resp.text)
 
     async def test_invalid_rank_retries_once_with_refreshed_dp_size(self):
+        """Test that when dp_size shrinks and stored rank becomes invalid, retry works."""
         sent_bodies = []
-        session_id = self._session_key_with_changed_rank(4, 2)
-        first_rank = self.srv._rendezvous_rank(session_id, 4)
-        second_rank = self.srv._rendezvous_rank(session_id, 2)
+        session_id = "test-session-retry"
+
+        # Pre-populate allocator to have session at rank 3 (which will be invalid for dp_size=2)
+        allocator = self.srv._get_or_create_allocator(
+            {"name": "sglang", "api_base_url": "http://host:8000/v1/chat/completions"},
+            4
+        )
+        # Assign ranks 0,1,2 to other sessions first
+        allocator.assign("session-0")
+        allocator.assign("session-1")
+        allocator.assign("session-2")
+        # Now assign rank 3 to our test session
+        allocator.assign(session_id)
 
         async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
             sent_bodies.append(dict(body))
@@ -1194,9 +1204,11 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertEqual(len(sent_bodies), 2)
-        self.assertEqual(sent_bodies[0]["routed_dp_rank"], first_rank)
-        self.assertEqual(sent_bodies[1]["routed_dp_rank"], second_rank)
-        self.assertEqual(resp.headers["X-Router-DP-Rank"], str(second_rank))
+        # First request had rank 3 (invalid for dp_size=2)
+        self.assertEqual(sent_bodies[0]["routed_dp_rank"], 3)
+        # Second request got rank 0 (first available in new allocator with dp_size=2)
+        self.assertEqual(sent_bodies[1]["routed_dp_rank"], 0)
+        self.assertEqual(resp.headers["X-Router-DP-Rank"], "0")
 
     async def test_override_invalid_after_refresh_returns_400_without_remap(self):
         sent_bodies = []

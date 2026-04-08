@@ -176,7 +176,10 @@ def anthropic_to_openai(req: dict) -> dict:
     if fmt and fmt.get("type") == "json_schema":
         openai_req["response_format"] = {
             "type": "json_schema",
-            "json_schema": fmt.get("schema", {}),
+            "json_schema": {
+                "name": "response",
+                "schema": fmt.get("schema", {}),
+            },
         }
 
     # metadata.user_id → user
