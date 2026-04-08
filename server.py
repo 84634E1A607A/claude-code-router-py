@@ -11,6 +11,7 @@ import os
 import re
 import time
 import uuid
+import zlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import AsyncIterator
@@ -36,9 +37,6 @@ _DP_OVERRIDE_HEADER = "X-Routed-DP-Rank"
 _DP_SERVER_INFO_TTL_SEC = 30
 _INVALID_DP_RANK_RE = re.compile(r"routed_dp_rank.*out of range", re.IGNORECASE | re.DOTALL)
 _WHITESPACE_RE = re.compile(r"\s+")
-_SUBAGENT_WORKTREE_RE = re.compile(
-    r"Working directory:\s+\S*/\.claude/worktrees/(?P<agent_id>agent-[A-Za-z0-9_-]+)\b"
-)
 
 
 @dataclass
@@ -47,6 +45,8 @@ class DPRoutingDecision:
     rank: int | None = None
     source: str | None = None
     sticky_key: str | None = None
+    session_id: str | None = None
+    subagent_id: str | None = None
 
     def response_headers(self) -> dict[str, str]:
         headers: dict[str, str] = {}
@@ -200,39 +200,64 @@ def _normalize_system_prompt(text: str) -> str:
     return _WHITESPACE_RE.sub(" ", text).strip()
 
 
-def _extract_subagent_worktree_id(text: str) -> str | None:
-    """Extract a Claude Code subagent worktree identifier from system prompt text."""
-    match = _SUBAGENT_WORKTREE_RE.search(text)
-    if not match:
+def _short_sticky_hash(text: str) -> str:
+    """Return a short, lightweight hash for sticky routing identifiers."""
+    return f"{zlib.adler32(text.encode('utf-8', 'surrogatepass')) & 0xffff:04x}"
+
+
+def _extract_subagent_hash_input(req: dict) -> str | None:
+    """Extract the content block used to derive a subagent identifier.
+
+    This uses `messages[0].content[1].text` when present.
+    """
+    messages = req.get("messages")
+    if not isinstance(messages, list) or not messages:
         return None
-    return match.group("agent_id")
+
+    first_message = messages[0]
+    if not isinstance(first_message, dict):
+        return None
+
+    content = first_message.get("content")
+    if not isinstance(content, list) or len(content) < 2:
+        return None
+
+    block = content[1]
+    if not isinstance(block, dict):
+        return None
+
+    text = block.get("text")
+    if not isinstance(text, str):
+        return None
+
+    return text
 
 
-def _derive_dp_sticky_key(session_id: str, provider: dict, anthropic_req: dict) -> tuple[str, str]:
+def _derive_dp_sticky_key(session_id: str, provider: dict, anthropic_req: dict) -> tuple[str, str, str | None]:
     """Build the sticky key used for DP routing.
 
-    `session_system` mode prefers a Claude Code subagent worktree identifier
-    when present in the system prompt and otherwise falls back to a normalized
-    system-prompt hash.
+    `session_system` mode prefers a hash of `messages[0].content[1]` when that
+    block is present and otherwise falls back to a normalized system-prompt hash.
     """
     mode = _get_dp_sticky_mode(provider)
     if mode != "session_system":
-        return session_id, "session"
+        return session_id, "session", None
+
+    subagent_hash_input = _extract_subagent_hash_input(anthropic_req)
+    if subagent_hash_input:
+        subagent_id = _short_sticky_hash(subagent_hash_input)
+        return f"{session_id}:{subagent_id}", "session_system", subagent_id
 
     system_text = _extract_anthropic_system_text(anthropic_req)
     if not system_text:
-        return session_id, "session"
-
-    subagent_id = _extract_subagent_worktree_id(system_text)
-    if subagent_id:
-        return f"{session_id}:{subagent_id}", "session_system"
+        return session_id, "session", None
 
     normalized_system = _normalize_system_prompt(system_text)
     if not normalized_system:
-        return session_id, "session"
+        return session_id, "session", None
 
-    digest = hashlib.sha256(normalized_system.encode("utf-8", "surrogatepass")).hexdigest()[:16]
-    return f"{session_id}:{digest}", "session_system"
+    digest = _short_sticky_hash(normalized_system)
+    return f"{session_id}:{digest}", "session_system", None
 
 
 def set_config(cfg: dict) -> None:
@@ -492,11 +517,13 @@ def _log_dp_routing(provider: dict, decision: DPRoutingDecision, remapped: bool 
     if decision.rank is None:
         return
     logger.info(
-        "DP routing provider=%s dp_size=%s rank=%s source=%s sticky_key=%s remapped=%s",
+        "DP routing provider=%s dp_size=%s rank=%s source=%s session_id=%s subagent_id=%s sticky_key=%s remapped=%s",
         provider.get("name"),
         decision.dp_size,
         decision.rank,
         decision.source,
+        decision.session_id,
+        decision.subagent_id,
         decision.sticky_key,
         remapped,
     )
@@ -536,7 +563,7 @@ async def _resolve_dp_routing(
     if not session_id:
         session_id = str(uuid.uuid4())
 
-    sticky_key, sticky_source = _derive_dp_sticky_key(session_id, provider, anthropic_req)
+    sticky_key, sticky_source, subagent_id = _derive_dp_sticky_key(session_id, provider, anthropic_req)
 
     # Use allocator for round-robin assignment (with lazy cleanup)
     allocator = _get_or_create_allocator(provider, dp_size)
@@ -545,11 +572,14 @@ async def _resolve_dp_routing(
     decision.rank = rank
     decision.source = sticky_source
     decision.sticky_key = sticky_key
+    decision.session_id = session_id
+    decision.subagent_id = subagent_id
 
     # Log session assignment
     logger.info(
-        "DP assign: session=%s sticky_source=%s rank=%d is_new=%s total_sessions=%d",
+        "DP assign: session=%s subagent_id=%s sticky_source=%s rank=%d is_new=%s total_sessions=%d",
         session_id[:8] + "..." if len(session_id) > 8 else session_id,
+        subagent_id,
         sticky_source,
         rank,
         is_new,

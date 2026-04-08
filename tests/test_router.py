@@ -800,44 +800,77 @@ class TestTokenCounting(unittest.TestCase):
 
 class TestDPRoutingStickyKeys(unittest.TestCase):
 
+    def _expected_subagent_id(self, block):
+        import zlib
+        return f"{zlib.adler32(block['text'].encode('utf-8')) & 0xffff:04x}"
+
     def test_derive_dp_sticky_key_defaults_to_session(self):
         import server as srv_mod
 
-        sticky_key, source = srv_mod._derive_dp_sticky_key("session-1", {}, {"system": "Prompt"})
+        sticky_key, source, subagent_id = srv_mod._derive_dp_sticky_key("session-1", {}, {"system": "Prompt"})
         self.assertEqual(sticky_key, "session-1")
         self.assertEqual(source, "session")
+        self.assertIsNone(subagent_id)
 
     def test_derive_dp_sticky_key_uses_system_hash(self):
         import server as srv_mod
 
         provider = {"dp_routing": {"enabled": True, "sticky_mode": "session_system"}}
-        sticky_key, source = srv_mod._derive_dp_sticky_key("session-1", provider, {"system": "Agent prompt"})
+        sticky_key, source, subagent_id = srv_mod._derive_dp_sticky_key("session-1", provider, {"system": "Agent prompt"})
 
         self.assertTrue(sticky_key.startswith("session-1:"))
         self.assertEqual(source, "session_system")
+        self.assertIsNone(subagent_id)
 
     def test_derive_dp_sticky_key_normalizes_whitespace(self):
         import server as srv_mod
 
         provider = {"dp_routing": {"enabled": True, "sticky_mode": "session_system"}}
-        sticky_one, _ = srv_mod._derive_dp_sticky_key("session-1", provider, {"system": "Agent   prompt"})
-        sticky_two, _ = srv_mod._derive_dp_sticky_key("session-1", provider, {"system": "  Agent prompt\n"})
+        sticky_one, _, _ = srv_mod._derive_dp_sticky_key("session-1", provider, {"system": "Agent   prompt"})
+        sticky_two, _, _ = srv_mod._derive_dp_sticky_key("session-1", provider, {"system": "  Agent prompt\n"})
 
         self.assertEqual(sticky_one, sticky_two)
 
-    def test_derive_dp_sticky_key_prefers_subagent_worktree_id(self):
+    def test_extract_subagent_hash_input_uses_messages_first_content_second_block(self):
+        import server as srv_mod
+
+        block = {"type": "text", "text": "Exit immediately. Just respond with \"Exiting now\" and do nothing else."}
+        req = {
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<system-reminder>"},
+                    block,
+                ],
+            }],
+        }
+
+        self.assertEqual(
+            srv_mod._extract_subagent_hash_input(req),
+            block["text"],
+        )
+
+    def test_derive_dp_sticky_key_prefers_subagent_hash_input(self):
         import server as srv_mod
 
         provider = {"dp_routing": {"enabled": True, "sticky_mode": "session_system"}}
-        system = (
-            "You are a subagent.\n"
-            "Working directory: /home/ajax/tmp/.claude/worktrees/agent-ace4e1d2\n"
-            "Other prompt text."
-        )
-        sticky_key, source = srv_mod._derive_dp_sticky_key("session-1", provider, {"system": system})
+        block = {"type": "text", "text": "Exit immediately. Just respond with \"Exiting now\" and do nothing else."}
+        req = {
+            "system": "fallback system prompt",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<system-reminder>"},
+                    block,
+                ],
+            }],
+        }
+        expected_subagent_id = self._expected_subagent_id(block)
+        sticky_key, source, subagent_id = srv_mod._derive_dp_sticky_key("session-1", provider, req)
 
-        self.assertEqual(sticky_key, "session-1:agent-ace4e1d2")
+        self.assertEqual(sticky_key, f"session-1:{expected_subagent_id}")
         self.assertEqual(source, "session_system")
+        self.assertEqual(subagent_id, expected_subagent_id)
 
 
 class TestTokenCountingEndpoint(unittest.IsolatedAsyncioTestCase):
@@ -1407,26 +1440,51 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
             return self._openai_resp()
 
         headers = {self.srv._CLAUDE_SESSION_HEADER: "claude-session"}
+        first_block = {"type": "text", "text": "Subagent A"}
+        second_block = {"type": "text", "text": "Subagent B"}
+        expected_first = self.srv._short_sticky_hash(first_block["text"])
+        expected_second = self.srv._short_sticky_hash(second_block["text"])
         with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
              patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
             first = await self.client.post(
                 "/v1/messages",
                 json=self._messages_req({
-                    "system": "Working directory: /home/ajax/tmp/.claude/worktrees/agent-main1234\nMain agent"
+                    "system": "fallback system prompt",
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "<system-reminder>"},
+                            first_block,
+                        ],
+                    }],
                 }),
                 headers=headers,
             )
             second = await self.client.post(
                 "/v1/messages",
                 json=self._messages_req({
-                    "system": "Working directory: /home/ajax/tmp/.claude/worktrees/agent-explore9\nExplore agent"
+                    "system": "fallback system prompt",
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "<system-reminder>"},
+                            second_block,
+                        ],
+                    }],
                 }),
                 headers=headers,
             )
             third = await self.client.post(
                 "/v1/messages",
                 json=self._messages_req({
-                    "system": "Working directory: /home/ajax/tmp/.claude/worktrees/agent-main1234\nMain   agent\n"
+                    "system": "changed fallback system prompt",
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "<system-reminder changed>"},
+                            first_block,
+                        ],
+                    }],
                 }),
                 headers=headers,
             )
@@ -1437,9 +1495,9 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent_bodies[0]["routed_dp_rank"], 0)
         self.assertEqual(sent_bodies[1]["routed_dp_rank"], 1)
         self.assertEqual(sent_bodies[2]["routed_dp_rank"], 0)
-        self.assertEqual(first.headers["X-Router-Sticky-Key"], "claude-session:agent-main1234")
-        self.assertEqual(second.headers["X-Router-Sticky-Key"], "claude-session:agent-explore9")
-        self.assertEqual(third.headers["X-Router-Sticky-Key"], "claude-session:agent-main1234")
+        self.assertEqual(first.headers["X-Router-Sticky-Key"], f"claude-session:{expected_first}")
+        self.assertEqual(second.headers["X-Router-Sticky-Key"], f"claude-session:{expected_second}")
+        self.assertEqual(third.headers["X-Router-Sticky-Key"], f"claude-session:{expected_first}")
 
     async def test_invalid_rank_retries_once_with_refreshed_dp_size(self):
         """Test that when dp_size shrinks and stored rank becomes invalid, retry works."""

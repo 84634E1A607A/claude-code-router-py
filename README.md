@@ -150,7 +150,7 @@ endpoint and uses that to inject `routed_dp_rank`.
 Notes:
 - `dp_routing.enabled: true` turns on `routed_dp_rank` injection for `/v1/messages`
 - `dp_routing.sticky_mode: "session"` uses `X-Claude-Code-Session-Id` as the sticky key
-- `dp_routing.sticky_mode: "session_system"` uses `X-Claude-Code-Session-Id + subagent worktree id` when a Claude Code system prompt includes `Working directory: .../.claude/worktrees/agent-...`, and otherwise falls back to `sha256(normalized system prompt)`
+- `dp_routing.sticky_mode: "session_system"` uses `X-Claude-Code-Session-Id + short hash(messages[0].content[1].text)` when that text is present, and otherwise falls back to a short hash of the normalized system prompt
 - `X-Routed-DP-Rank` can be sent explicitly for testing
 - if the backend reports `dp_size <= 1`, the router does not inject `routed_dp_rank`
 
@@ -183,16 +183,16 @@ Optional provider block for routing one Claude Code session to one SGLang DP wor
 |---|---|
 | `enabled` | Enable SGLang DP rank discovery and `routed_dp_rank` injection for `/v1/messages` |
 | `server_info_ttl_sec` | Cache TTL for `/get_server_info` lookups (default `30`) |
-| `sticky_mode` | `session` (default) or `session_system` to separate Claude Code subagents by worktree id when present, else normalized system prompt hash |
+| `sticky_mode` | `session` (default) or `session_system` to separate Claude Code subagents by hashing `messages[0].content[1].text` when present, else normalized system prompt hash |
 
 When enabled, the router:
 - fetches `dp_size` from the backend's `/get_server_info`
 - injects `routed_dp_rank` only when `dp_size > 1`
 - uses `X-Claude-Code-Session-Id` for sticky routing by default
-- can optionally derive the sticky key from `X-Claude-Code-Session-Id + agent-...` when the Claude Code system prompt exposes a subagent worktree path, falling back to `X-Claude-Code-Session-Id + sha256(normalized system prompt)`
+- can optionally derive the sticky key from `X-Claude-Code-Session-Id + short hash(messages[0].content[1].text)`, falling back to `X-Claude-Code-Session-Id + short hash(normalized system prompt)` when that text is absent
 - honors `X-Routed-DP-Rank` as a manual override
 
-`session_system` is still a heuristic, not a true subagent ID. It is stronger when Claude Code exposes a unique worktree path for the subagent, but it still falls back to prompt hashing when that path is absent.
+`session_system` is still a heuristic, not a true subagent ID. It is strongest when the first user message carries a stable subagent-specific block at `messages[0].content[1]`, and it still falls back to prompt hashing when that block is absent.
 
 CLI / env equivalents:
 - `python main.py ... --dp-routing --dp-server-info-ttl-sec 30 --dp-sticky-mode session_system`
