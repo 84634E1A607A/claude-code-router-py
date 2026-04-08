@@ -5,6 +5,7 @@ to an OpenAI-compatible provider, converting formats in both directions.
 
 import json
 import hashlib
+import inspect
 import logging
 import os
 import re
@@ -34,6 +35,10 @@ _CLAUDE_SESSION_HEADER = "X-Claude-Code-Session-Id"
 _DP_OVERRIDE_HEADER = "X-Routed-DP-Rank"
 _DP_SERVER_INFO_TTL_SEC = 30
 _INVALID_DP_RANK_RE = re.compile(r"routed_dp_rank.*out of range", re.IGNORECASE | re.DOTALL)
+_WHITESPACE_RE = re.compile(r"\s+")
+_SUBAGENT_WORKTREE_RE = re.compile(
+    r"Working directory:\s+\S*/\.claude/worktrees/(?P<agent_id>agent-[A-Za-z0-9_-]+)\b"
+)
 
 
 @dataclass
@@ -47,7 +52,7 @@ class DPRoutingDecision:
         headers: dict[str, str] = {}
         if self.rank is not None:
             headers["X-Router-DP-Rank"] = str(self.rank)
-        if self.source == "session" and self.sticky_key:
+        if self.source in {"session", "session_system"} and self.sticky_key:
             headers["X-Router-Sticky-Key"] = self.sticky_key
         return headers
 
@@ -163,6 +168,73 @@ def _get_session_ttl(provider: dict) -> float:
         return 10800.0
 
 
+def _get_dp_sticky_mode(provider: dict) -> str:
+    """Get DP sticky-key mode from provider config, defaulting to session."""
+    cfg = provider.get("dp_routing")
+    if not isinstance(cfg, dict):
+        return "session"
+    mode = str(cfg.get("sticky_mode", "session")).strip().lower()
+    if mode in {"session", "session_system"}:
+        return mode
+    return "session"
+
+
+def _extract_anthropic_system_text(req: dict) -> str:
+    """Extract text-only content from an Anthropic system prompt."""
+    system = req.get("system")
+    if isinstance(system, str):
+        return system
+    if isinstance(system, list):
+        parts: list[str] = []
+        for block in system:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return ""
+
+
+def _normalize_system_prompt(text: str) -> str:
+    """Normalize prompt text to avoid fragmentation on whitespace-only changes."""
+    return _WHITESPACE_RE.sub(" ", text).strip()
+
+
+def _extract_subagent_worktree_id(text: str) -> str | None:
+    """Extract a Claude Code subagent worktree identifier from system prompt text."""
+    match = _SUBAGENT_WORKTREE_RE.search(text)
+    if not match:
+        return None
+    return match.group("agent_id")
+
+
+def _derive_dp_sticky_key(session_id: str, provider: dict, anthropic_req: dict) -> tuple[str, str]:
+    """Build the sticky key used for DP routing.
+
+    `session_system` mode prefers a Claude Code subagent worktree identifier
+    when present in the system prompt and otherwise falls back to a normalized
+    system-prompt hash.
+    """
+    mode = _get_dp_sticky_mode(provider)
+    if mode != "session_system":
+        return session_id, "session"
+
+    system_text = _extract_anthropic_system_text(anthropic_req)
+    if not system_text:
+        return session_id, "session"
+
+    subagent_id = _extract_subagent_worktree_id(system_text)
+    if subagent_id:
+        return f"{session_id}:{subagent_id}", "session_system"
+
+    normalized_system = _normalize_system_prompt(system_text)
+    if not normalized_system:
+        return session_id, "session"
+
+    digest = hashlib.sha256(normalized_system.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    return f"{session_id}:{digest}", "session_system"
+
+
 def set_config(cfg: dict) -> None:
     global _config
     _config = cfg
@@ -193,11 +265,15 @@ def _build_config_from_env() -> dict | None:
         "api_key": os.environ.get("CCR_API_KEY") or os.environ.get("API_KEY", ""),
         "max_retries": int(os.environ.get("CCR_MAX_RETRIES", "3")),
     }
+    if (tokenizer_path := os.environ.get("CCR_TOKENIZER_PATH") or os.environ.get("TOKENIZER_PATH")):
+        provider["tokenizer_path"] = tokenizer_path
     if os.environ.get("CCR_DP_ROUTING_ENABLED", "").strip().lower() in ("1", "true", "yes"):
         dp_routing_cfg: dict = {
             "enabled": True,
             "server_info_ttl_sec": int(os.environ.get("CCR_DP_SERVER_INFO_TTL_SEC", str(_DP_SERVER_INFO_TTL_SEC))),
         }
+        if (v := os.environ.get("CCR_DP_STICKY_MODE")) is not None:
+            dp_routing_cfg["sticky_mode"] = v
         if (v := os.environ.get("CCR_DP_SESSION_TTL_SEC")) is not None:
             dp_routing_cfg["session_ttl_sec"] = float(v)
         provider["dp_routing"] = dp_routing_cfg
@@ -429,6 +505,7 @@ def _log_dp_routing(provider: dict, decision: DPRoutingDecision, remapped: bool 
 async def _resolve_dp_routing(
     request: Request,
     provider: dict,
+    anthropic_req: dict,
     base_openai_req: dict,
     force_refresh: bool = False,
 ) -> tuple[dict, DPRoutingDecision]:
@@ -455,22 +532,25 @@ async def _resolve_dp_routing(
         return openai_req, decision
 
     # Get or generate session ID
-    sticky_key = request.headers.get(_CLAUDE_SESSION_HEADER)
-    if not sticky_key:
-        sticky_key = str(uuid.uuid4())
+    session_id = request.headers.get(_CLAUDE_SESSION_HEADER)
+    if not session_id:
+        session_id = str(uuid.uuid4())
+
+    sticky_key, sticky_source = _derive_dp_sticky_key(session_id, provider, anthropic_req)
 
     # Use allocator for round-robin assignment (with lazy cleanup)
     allocator = _get_or_create_allocator(provider, dp_size)
     rank, is_new = allocator.assign(sticky_key)
     openai_req["routed_dp_rank"] = rank
     decision.rank = rank
-    decision.source = "session"
+    decision.source = sticky_source
     decision.sticky_key = sticky_key
 
     # Log session assignment
     logger.info(
-        "DP assign: session=%s rank=%d is_new=%s total_sessions=%d",
-        sticky_key[:8] + "..." if len(sticky_key) > 8 else sticky_key,
+        "DP assign: session=%s sticky_source=%s rank=%d is_new=%s total_sessions=%d",
+        session_id[:8] + "..." if len(session_id) > 8 else session_id,
+        sticky_source,
         rank,
         is_new,
         len(allocator.sessions),
@@ -482,12 +562,14 @@ async def _resolve_dp_routing(
 async def _retry_message_request_for_invalid_rank(
     request: Request,
     provider: dict,
+    anthropic_req: dict,
     base_openai_req: dict,
     old_decision: DPRoutingDecision,
 ) -> tuple[dict, DPRoutingDecision]:
     openai_req, new_decision = await _resolve_dp_routing(
         request,
         provider,
+        anthropic_req,
         base_openai_req,
         force_refresh=True,
     )
@@ -504,7 +586,10 @@ _tokenizer_cache: dict[str, object] = {}  # tokenizer_path → tokenizer
 def _get_tokenizer(tokenizer_path: str):
     if tokenizer_path not in _tokenizer_cache:
         from transformers import AutoTokenizer
-        _tokenizer_cache[tokenizer_path] = AutoTokenizer.from_pretrained(tokenizer_path)
+        _tokenizer_cache[tokenizer_path] = AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            trust_remote_code=True,
+        )
         logger.info("Loaded tokenizer from %s", tokenizer_path)
     return _tokenizer_cache[tokenizer_path]
 
@@ -531,9 +616,77 @@ def _extract_text_for_counting(req: dict) -> str:
 
 
 def _count_tokens_in_openai_req(req: dict, tokenizer_path: str) -> int:
-    text = _extract_text_for_counting(req)
     tok = _get_tokenizer(tokenizer_path)
+    text: str | None = None
+    apply_chat_template = getattr(tok, "apply_chat_template", None)
+
+    if callable(apply_chat_template):
+        kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": False,
+        }
+        try:
+            sig = inspect.signature(apply_chat_template)
+            if "tools" in sig.parameters and req.get("tools"):
+                kwargs["tools"] = req["tools"]
+            text = apply_chat_template(req.get("messages", []), **kwargs)
+        except Exception:
+            logger.debug("Falling back to flattened text token counting", exc_info=True)
+
+    if not isinstance(text, str):
+        text = _extract_text_for_counting(req)
     return len(tok.encode(text))
+
+
+def _resolve_tokenizer_path(provider: dict) -> str | None:
+    return (
+        provider.get("tokenizer_path")
+        or _config.get("tokenizer_path")
+        or os.environ.get("CCR_TOKENIZER_PATH")
+        or os.environ.get("TOKENIZER_PATH")
+    )
+
+
+def _sglang_tokenize_url(provider: dict) -> str:
+    api_base = _api_base(provider).rstrip("/")
+    root = api_base.removesuffix("/v1").removesuffix("/")
+    return f"{root}/tokenize"
+
+
+async def _count_tokens_via_sglang(provider: dict, model: str, prompt: str) -> int | None:
+    client = get_shared_client()
+    timeout = _timeout()
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "add_special_tokens": False,
+    }
+    try:
+        resp = await client.post(
+            _sglang_tokenize_url(provider),
+            headers=_provider_headers(provider),
+            json=payload,
+            timeout=timeout,
+        )
+    except Exception:
+        logger.debug("SGLang /tokenize request failed", exc_info=True)
+        return None
+
+    if resp.status_code in (404, 405, 501):
+        return None
+    if resp.status_code >= 400:
+        logger.debug("SGLang /tokenize returned %d: %s", resp.status_code, resp.text)
+        return None
+
+    try:
+        data = resp.json()
+        count = data.get("count")
+        if count is None:
+            return None
+        return int(count)
+    except Exception:
+        logger.debug("Invalid SGLang /tokenize response", exc_info=True)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -562,7 +715,7 @@ async def messages(request: Request):
     # Anthropic → OpenAI, then apply provider param defaults
     base_openai_req = anthropic_to_openai(body)
     base_openai_req = apply_provider_params(provider, base_openai_req)
-    openai_req, dp_decision = await _resolve_dp_routing(request, provider, base_openai_req)
+    openai_req, dp_decision = await _resolve_dp_routing(request, provider, body, base_openai_req)
     _log_dp_routing(provider, dp_decision)
     log_openai_request(openai_req)
 
@@ -581,6 +734,7 @@ async def messages(request: Request):
                 openai_req, dp_decision = await _retry_message_request_for_invalid_rank(
                     request,
                     provider,
+                    body,
                     base_openai_req,
                     dp_decision,
                 )
@@ -614,6 +768,7 @@ async def messages(request: Request):
             openai_req, dp_decision = await _retry_message_request_for_invalid_rank(
                 request,
                 provider,
+                body,
                 base_openai_req,
                 dp_decision,
             )
@@ -697,7 +852,12 @@ async def count_tokens(request: Request):
     openai_req = anthropic_to_openai(body)
     openai_req = apply_provider_params(provider, openai_req)
 
-    tokenizer_path = provider.get("tokenizer_path") or _config.get("tokenizer_path")
+    prompt_text = _extract_text_for_counting(openai_req)
+    backend_count = await _count_tokens_via_sglang(provider, model, prompt_text)
+    if backend_count is not None:
+        return {"input_tokens": backend_count}
+
+    tokenizer_path = _resolve_tokenizer_path(provider)
     if not tokenizer_path:
         return {"input_tokens": 0}
     try:

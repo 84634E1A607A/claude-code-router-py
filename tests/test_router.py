@@ -8,6 +8,7 @@ Run:
 """
 
 import asyncio
+import argparse
 import json
 import os
 import sys
@@ -679,6 +680,221 @@ class TestApplyProviderParams(unittest.TestCase):
         self.assertEqual(out["temperature"], 0.5)
 
 
+class TestBuildConfig(unittest.TestCase):
+
+    def test_main_build_config_includes_tokenizer_path(self):
+        from main import _build_config
+
+        args = argparse.Namespace(
+            api_base_url="http://host/v1/chat/completions",
+            api_key="k",
+            model="/model",
+            tokenizer_path="/models/tokenizer",
+            max_retries=2,
+            dp_routing=False,
+            dp_server_info_ttl_sec=30,
+            dp_sticky_mode="session",
+            temperature=None,
+            top_p=None,
+            max_tokens=None,
+            budget_tokens=None,
+            port=3456,
+            api_timeout_ms=120000,
+        )
+
+        cfg = _build_config(args)
+        self.assertEqual(cfg["Providers"][0]["tokenizer_path"], "/models/tokenizer")
+
+    def test_server_build_config_from_env_uses_tokenizer_path(self):
+        import server as srv_mod
+
+        env = {
+            "CCR_API_BASE_URL": "http://host/v1/chat/completions",
+            "CCR_TOKENIZER_PATH": "/models/from-env",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            cfg = srv_mod._build_config_from_env()
+
+        self.assertEqual(cfg["Providers"][0]["tokenizer_path"], "/models/from-env")
+
+    def test_main_build_config_includes_dp_sticky_mode(self):
+        from main import _build_config
+
+        args = argparse.Namespace(
+            api_base_url="http://host/v1/chat/completions",
+            api_key="k",
+            model="/model",
+            tokenizer_path=None,
+            max_retries=2,
+            dp_routing=True,
+            dp_server_info_ttl_sec=30,
+            dp_sticky_mode="session_system",
+            temperature=None,
+            top_p=None,
+            max_tokens=None,
+            budget_tokens=None,
+            port=3456,
+            api_timeout_ms=120000,
+        )
+
+        cfg = _build_config(args)
+        self.assertEqual(cfg["Providers"][0]["dp_routing"]["sticky_mode"], "session_system")
+
+    def test_server_build_config_from_env_uses_dp_sticky_mode(self):
+        import server as srv_mod
+
+        env = {
+            "CCR_API_BASE_URL": "http://host/v1/chat/completions",
+            "CCR_DP_ROUTING_ENABLED": "1",
+            "CCR_DP_STICKY_MODE": "session_system",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            cfg = srv_mod._build_config_from_env()
+
+        self.assertEqual(cfg["Providers"][0]["dp_routing"]["sticky_mode"], "session_system")
+
+
+class TestTokenCounting(unittest.TestCase):
+
+    def test_count_tokens_uses_chat_template_when_available(self):
+        import server as srv_mod
+
+        class FakeTokenizer:
+            def __init__(self):
+                self.encoded = None
+                self.tools = None
+
+            def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, tools=None):
+                self.tools = tools
+                return "templated prompt"
+
+            def encode(self, text):
+                self.encoded = text
+                return list(range(len(text)))
+
+        tok = FakeTokenizer()
+        req = {
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": "search"}}],
+        }
+
+        with patch.object(srv_mod, "_get_tokenizer", return_value=tok):
+            count = srv_mod._count_tokens_in_openai_req(req, "/models/tokenizer")
+
+        self.assertEqual(count, len("templated prompt"))
+        self.assertEqual(tok.encoded, "templated prompt")
+        self.assertEqual(tok.tools, req["tools"])
+
+    def test_resolve_tokenizer_path_falls_back_to_environment(self):
+        import server as srv_mod
+
+        with patch.dict(os.environ, {"TOKENIZER_PATH": "/models/fallback"}, clear=True):
+            self.assertEqual(srv_mod._resolve_tokenizer_path({}), "/models/fallback")
+
+    def test_sglang_tokenize_url_strips_v1(self):
+        import server as srv_mod
+
+        provider = {"api_base_url": "http://host:30000/v1/chat/completions"}
+        self.assertEqual(srv_mod._sglang_tokenize_url(provider), "http://host:30000/tokenize")
+
+
+class TestDPRoutingStickyKeys(unittest.TestCase):
+
+    def test_derive_dp_sticky_key_defaults_to_session(self):
+        import server as srv_mod
+
+        sticky_key, source = srv_mod._derive_dp_sticky_key("session-1", {}, {"system": "Prompt"})
+        self.assertEqual(sticky_key, "session-1")
+        self.assertEqual(source, "session")
+
+    def test_derive_dp_sticky_key_uses_system_hash(self):
+        import server as srv_mod
+
+        provider = {"dp_routing": {"enabled": True, "sticky_mode": "session_system"}}
+        sticky_key, source = srv_mod._derive_dp_sticky_key("session-1", provider, {"system": "Agent prompt"})
+
+        self.assertTrue(sticky_key.startswith("session-1:"))
+        self.assertEqual(source, "session_system")
+
+    def test_derive_dp_sticky_key_normalizes_whitespace(self):
+        import server as srv_mod
+
+        provider = {"dp_routing": {"enabled": True, "sticky_mode": "session_system"}}
+        sticky_one, _ = srv_mod._derive_dp_sticky_key("session-1", provider, {"system": "Agent   prompt"})
+        sticky_two, _ = srv_mod._derive_dp_sticky_key("session-1", provider, {"system": "  Agent prompt\n"})
+
+        self.assertEqual(sticky_one, sticky_two)
+
+    def test_derive_dp_sticky_key_prefers_subagent_worktree_id(self):
+        import server as srv_mod
+
+        provider = {"dp_routing": {"enabled": True, "sticky_mode": "session_system"}}
+        system = (
+            "You are a subagent.\n"
+            "Working directory: /home/ajax/tmp/.claude/worktrees/agent-ace4e1d2\n"
+            "Other prompt text."
+        )
+        sticky_key, source = srv_mod._derive_dp_sticky_key("session-1", provider, {"system": system})
+
+        self.assertEqual(sticky_key, "session-1:agent-ace4e1d2")
+        self.assertEqual(source, "session_system")
+
+
+class TestTokenCountingEndpoint(unittest.IsolatedAsyncioTestCase):
+
+    async def asyncSetUp(self):
+        import server as srv_mod
+
+        self.srv = srv_mod
+        srv_mod.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [{
+                "name": "sglang",
+                "api_base_url": "http://host:30000/v1/chat/completions",
+                "api_key": "k",
+                "tokenizer_path": "/models/tokenizer",
+            }],
+            "Router": {"default": "sglang,/model"},
+        })
+
+        from httpx import ASGITransport, AsyncClient
+        self.client = AsyncClient(
+            transport=ASGITransport(app=srv_mod.app),
+            base_url="http://test",
+            timeout=60.0,
+        )
+
+    async def asyncTearDown(self):
+        await self.client.aclose()
+        self.srv.set_config({})
+
+    async def test_count_tokens_prefers_sglang_backend(self):
+        with patch.object(self.srv, "_count_tokens_via_sglang", new=AsyncMock(return_value=17)) as backend_mock, \
+             patch.object(self.srv, "_count_tokens_in_openai_req") as local_mock:
+            resp = await self.client.post("/v1/messages/count_tokens", json={
+                "model": "ignored",
+                "messages": [{"role": "user", "content": "hello"}],
+            })
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json(), {"input_tokens": 17})
+        backend_mock.assert_awaited_once()
+        local_mock.assert_not_called()
+
+    async def test_count_tokens_falls_back_to_local_tokenizer(self):
+        with patch.object(self.srv, "_count_tokens_via_sglang", new=AsyncMock(return_value=None)) as backend_mock, \
+             patch.object(self.srv, "_count_tokens_in_openai_req", return_value=23) as local_mock:
+            resp = await self.client.post("/v1/messages/count_tokens", json={
+                "model": "ignored",
+                "messages": [{"role": "user", "content": "hello"}],
+            })
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json(), {"input_tokens": 23})
+        backend_mock.assert_awaited_once()
+        local_mock.assert_called_once()
+
+
 # ============================================================================
 # Unit — batch conversion
 # ============================================================================
@@ -1167,6 +1383,63 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent_bodies[0]["routed_dp_rank"], expected_rank)
         self.assertEqual(resp.headers["X-Router-DP-Rank"], str(expected_rank))
         self.assertIn("message_start", resp.text)
+
+    async def test_session_system_sticky_mode_separates_subagents(self):
+        sent_bodies = []
+        self.srv.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [{
+                "name": "sglang",
+                "api_base_url": "http://host:8000/v1/chat/completions",
+                "api_key": "k",
+                "max_retries": 1,
+                "dp_routing": {
+                    "enabled": True,
+                    "server_info_ttl_sec": 30,
+                    "sticky_mode": "session_system",
+                },
+            }],
+            "Router": {"default": "sglang,/model"},
+        })
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_bodies.append(dict(body))
+            return self._openai_resp()
+
+        headers = {self.srv._CLAUDE_SESSION_HEADER: "claude-session"}
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            first = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req({
+                    "system": "Working directory: /home/ajax/tmp/.claude/worktrees/agent-main1234\nMain agent"
+                }),
+                headers=headers,
+            )
+            second = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req({
+                    "system": "Working directory: /home/ajax/tmp/.claude/worktrees/agent-explore9\nExplore agent"
+                }),
+                headers=headers,
+            )
+            third = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req({
+                    "system": "Working directory: /home/ajax/tmp/.claude/worktrees/agent-main1234\nMain   agent\n"
+                }),
+                headers=headers,
+            )
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(third.status_code, 200, third.text)
+        self.assertEqual(sent_bodies[0]["routed_dp_rank"], 0)
+        self.assertEqual(sent_bodies[1]["routed_dp_rank"], 1)
+        self.assertEqual(sent_bodies[2]["routed_dp_rank"], 0)
+        self.assertEqual(first.headers["X-Router-Sticky-Key"], "claude-session:agent-main1234")
+        self.assertEqual(second.headers["X-Router-Sticky-Key"], "claude-session:agent-explore9")
+        self.assertEqual(third.headers["X-Router-Sticky-Key"], "claude-session:agent-main1234")
 
     async def test_invalid_rank_retries_once_with_refreshed_dp_size(self):
         """Test that when dp_size shrinks and stored rank becomes invalid, retry works."""

@@ -30,10 +30,13 @@ def _build_config(args: argparse.Namespace) -> dict:
         "api_key": args.api_key or os.environ.get("API_KEY", ""),
         "max_retries": args.max_retries,
     }
+    if args.tokenizer_path:
+        provider["tokenizer_path"] = args.tokenizer_path
     if args.dp_routing:
         provider["dp_routing"] = {
             "enabled": True,
             "server_info_ttl_sec": args.dp_server_info_ttl_sec,
+            "sticky_mode": args.dp_sticky_mode,
         }
     if params:
         provider["params"] = params
@@ -60,11 +63,16 @@ def main() -> None:
                         help="Provider API key (falls back to $API_KEY)")
     parser.add_argument("--model", default="/model", metavar="MODEL",
                         help="Model name/path forwarded to the provider")
+    parser.add_argument("--tokenizer-path", default=os.environ.get("TOKENIZER_PATH"), metavar="PATH",
+                        help="Tokenizer path/repo for /v1/messages/count_tokens")
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--dp-routing", action="store_true",
                         help="Enable SGLang DP-rank pinning for /v1/messages")
     parser.add_argument("--dp-server-info-ttl-sec", type=int, default=30,
                         help="TTL for cached /get_server_info dp_size lookups")
+    parser.add_argument("--dp-sticky-mode", default=os.environ.get("CCR_DP_STICKY_MODE", "session"),
+                        choices=["session", "session_system"],
+                        help="Sticky-key mode for DP routing")
 
     # ── Provider params ───────────────────────────────────────────────────────
     parser.add_argument("--temperature", type=float, default=None)

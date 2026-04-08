@@ -14,8 +14,10 @@ Claude Code / any Anthropic client
 
 ## Quick Start
 
+Local development in this repo uses the `ccr-py` conda environment. If `conda` is not on your `PATH`, use `~/miniconda3/bin/conda`.
+
 ```bash
-pip install -r requirements.txt
+~/miniconda3/bin/conda run -n ccr-py pip install -r requirements.txt
 ```
 
 Point your Anthropic client at the proxy:
@@ -30,7 +32,7 @@ export ANTHROPIC_API_KEY=any-value   # validated by the backend, not by ccr-py
 ### Development (single process)
 
 ```bash
-python main.py --config config.json
+~/miniconda3/bin/conda run -n ccr-py python main.py --config config.json
 ```
 
 ### Production (recommended)
@@ -60,13 +62,13 @@ gunicorn server:app \
 Alternatively via `main.py`:
 
 ```bash
-python main.py --config config.json --workers 32
+~/miniconda3/bin/conda run -n ccr-py python main.py --config config.json --workers 32
 ```
 
 You can point the server at any config path with:
 
 ```bash
-python main.py --config /path/to/config.json
+~/miniconda3/bin/conda run -n ccr-py python main.py --config /path/to/config.json
 ```
 
 ### Workers guideline
@@ -90,10 +92,12 @@ Each worker is an independent process with its own asyncio event loop. A single 
       "name": "my-provider",
       "api_base_url": "http://your-openai-endpoint/v1/chat/completions",
       "api_key": "$MY_API_KEY",
+      "tokenizer_path": "/models/your-tokenizer",
       "max_retries": 3,
       "dp_routing": {
         "enabled": true,
-        "server_info_ttl_sec": 30
+        "server_info_ttl_sec": 30,
+        "sticky_mode": "session_system"
       },
       "params": {
         "temperature": 1.0,
@@ -145,7 +149,8 @@ endpoint and uses that to inject `routed_dp_rank`.
 
 Notes:
 - `dp_routing.enabled: true` turns on `routed_dp_rank` injection for `/v1/messages`
-- `X-Claude-Code-Session-Id` is used as the sticky key when present
+- `dp_routing.sticky_mode: "session"` uses `X-Claude-Code-Session-Id` as the sticky key
+- `dp_routing.sticky_mode: "session_system"` uses `X-Claude-Code-Session-Id + subagent worktree id` when a Claude Code system prompt includes `Working directory: .../.claude/worktrees/agent-...`, and otherwise falls back to `sha256(normalized system prompt)`
 - `X-Routed-DP-Rank` can be sent explicitly for testing
 - if the backend reports `dp_size <= 1`, the router does not inject `routed_dp_rank`
 
@@ -165,6 +170,7 @@ Notes:
 | `name` | yes | Identifier used in `Router` |
 | `api_base_url` | yes | Full URL of the OpenAI-compatible endpoint (e.g. `.../v1/chat/completions`) |
 | `api_key` | yes | API key sent as `Authorization: Bearer <key>` |
+| `tokenizer_path` | no | Hugging Face path/repo used by `POST /v1/messages/count_tokens`; may also come from `CCR_TOKENIZER_PATH` or `TOKENIZER_PATH` |
 | `max_retries` | no | Retries on 429/5xx (default `3`) |
 | `dp_routing` | no | SGLang-only DP rank pinning config (see below) |
 | `params` | no | Parameter defaults/overrides (see below) |
@@ -177,17 +183,22 @@ Optional provider block for routing one Claude Code session to one SGLang DP wor
 |---|---|
 | `enabled` | Enable SGLang DP rank discovery and `routed_dp_rank` injection for `/v1/messages` |
 | `server_info_ttl_sec` | Cache TTL for `/get_server_info` lookups (default `30`) |
+| `sticky_mode` | `session` (default) or `session_system` to separate Claude Code subagents by worktree id when present, else normalized system prompt hash |
 
 When enabled, the router:
 - fetches `dp_size` from the backend's `/get_server_info`
 - injects `routed_dp_rank` only when `dp_size > 1`
-- uses `X-Claude-Code-Session-Id` for sticky session hashing
+- uses `X-Claude-Code-Session-Id` for sticky routing by default
+- can optionally derive the sticky key from `X-Claude-Code-Session-Id + agent-...` when the Claude Code system prompt exposes a subagent worktree path, falling back to `X-Claude-Code-Session-Id + sha256(normalized system prompt)`
 - honors `X-Routed-DP-Rank` as a manual override
 
+`session_system` is still a heuristic, not a true subagent ID. It is stronger when Claude Code exposes a unique worktree path for the subagent, but it still falls back to prompt hashing when that path is absent.
+
 CLI / env equivalents:
-- `python main.py ... --dp-routing --dp-server-info-ttl-sec 30`
+- `python main.py ... --dp-routing --dp-server-info-ttl-sec 30 --dp-sticky-mode session_system`
 - `CCR_DP_ROUTING_ENABLED=1`
 - `CCR_DP_SERVER_INFO_TTL_SEC=30`
+- `CCR_DP_STICKY_MODE=session_system`
 
 Request headers:
 - `X-Claude-Code-Session-Id`: opaque session key used for sticky DP-rank selection
@@ -378,6 +389,7 @@ CLI flags override the corresponding `config.json` values.
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/v1/messages` | Main Messages API — streaming and non-streaming |
+| `POST` | `/v1/messages/count_tokens` | Count prompt tokens, preferring SGLang `/tokenize` and falling back to the configured tokenizer |
 | `GET` | `/health` | Returns `{"status": "ok"}` |
 
 
