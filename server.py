@@ -9,9 +9,11 @@ import inspect
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 import zlib
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import AsyncIterator
@@ -156,6 +158,257 @@ class DPAllocator:
 _dp_allocators: dict[str, DPAllocator] = {}
 
 
+@dataclass
+class RequestMetricsContext:
+    provider_key: str
+    provider_name: str
+    dp_rank: int | None
+    started_at: float
+    is_stream: bool
+
+
+class RuntimeMetrics:
+    """Tracks per-worker runtime metrics for requests, tokens, and DP usage."""
+
+    def __init__(self, throughput_window_sec: float = 60.0):
+        self.throughput_window_sec = throughput_window_sec
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            self.started_at = time.monotonic()
+            self.requests_started = 0
+            self.requests_completed = 0
+            self.requests_failed = 0
+            self.streaming_requests_started = 0
+            self.non_streaming_requests_started = 0
+            self.active_requests = 0
+            self.input_tokens = 0
+            self.output_tokens = 0
+            self.total_latency_sec = 0.0
+            self._provider_stats: dict[str, dict] = {}
+            self._recent_completions: deque[dict] = deque()
+
+    def _ensure_provider_stats(self, provider_key: str, provider_name: str) -> dict:
+        stats = self._provider_stats.get(provider_key)
+        if stats is None:
+            stats = {
+                "provider_name": provider_name,
+                "requests_started": 0,
+                "requests_completed": 0,
+                "requests_failed": 0,
+                "streaming_requests_started": 0,
+                "non_streaming_requests_started": 0,
+                "active_requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_latency_sec": 0.0,
+                "per_dp": {},
+            }
+            self._provider_stats[provider_key] = stats
+        return stats
+
+    @staticmethod
+    def _ensure_dp_stats(provider_stats: dict, dp_rank: int) -> dict:
+        per_dp = provider_stats["per_dp"]
+        dp_stats = per_dp.get(dp_rank)
+        if dp_stats is None:
+            dp_stats = {
+                "requests_started": 0,
+                "requests_completed": 0,
+                "requests_failed": 0,
+                "streaming_requests_started": 0,
+                "non_streaming_requests_started": 0,
+                "active_requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_latency_sec": 0.0,
+            }
+            per_dp[dp_rank] = dp_stats
+        return dp_stats
+
+    def start_request(
+        self,
+        provider_key: str,
+        provider_name: str,
+        dp_rank: int | None,
+        is_stream: bool,
+    ) -> RequestMetricsContext:
+        started_at = time.monotonic()
+        with self._lock:
+            self.requests_started += 1
+            self.active_requests += 1
+            if is_stream:
+                self.streaming_requests_started += 1
+            else:
+                self.non_streaming_requests_started += 1
+
+            provider_stats = self._ensure_provider_stats(provider_key, provider_name)
+            provider_stats["requests_started"] += 1
+            provider_stats["active_requests"] += 1
+            if is_stream:
+                provider_stats["streaming_requests_started"] += 1
+            else:
+                provider_stats["non_streaming_requests_started"] += 1
+
+            if dp_rank is not None:
+                dp_stats = self._ensure_dp_stats(provider_stats, dp_rank)
+                dp_stats["requests_started"] += 1
+                dp_stats["active_requests"] += 1
+                if is_stream:
+                    dp_stats["streaming_requests_started"] += 1
+                else:
+                    dp_stats["non_streaming_requests_started"] += 1
+
+        return RequestMetricsContext(
+            provider_key=provider_key,
+            provider_name=provider_name,
+            dp_rank=dp_rank,
+            started_at=started_at,
+            is_stream=is_stream,
+        )
+
+    def finish_request(
+        self,
+        ctx: RequestMetricsContext,
+        *,
+        success: bool,
+        usage: dict | None = None,
+    ) -> None:
+        finished_at = time.monotonic()
+        elapsed = max(finished_at - ctx.started_at, 0.0)
+        input_tokens = int((usage or {}).get("input_tokens", 0) or 0)
+        output_tokens = int((usage or {}).get("output_tokens", 0) or 0)
+        total_tokens = input_tokens + output_tokens
+
+        with self._lock:
+            self.active_requests = max(self.active_requests - 1, 0)
+            provider_stats = self._ensure_provider_stats(ctx.provider_key, ctx.provider_name)
+            provider_stats["active_requests"] = max(provider_stats["active_requests"] - 1, 0)
+
+            dp_stats = None
+            if ctx.dp_rank is not None:
+                dp_stats = self._ensure_dp_stats(provider_stats, ctx.dp_rank)
+                dp_stats["active_requests"] = max(dp_stats["active_requests"] - 1, 0)
+
+            if success:
+                self.requests_completed += 1
+                self.input_tokens += input_tokens
+                self.output_tokens += output_tokens
+                self.total_latency_sec += elapsed
+                provider_stats["requests_completed"] += 1
+                provider_stats["input_tokens"] += input_tokens
+                provider_stats["output_tokens"] += output_tokens
+                provider_stats["total_latency_sec"] += elapsed
+                if dp_stats is not None:
+                    dp_stats["requests_completed"] += 1
+                    dp_stats["input_tokens"] += input_tokens
+                    dp_stats["output_tokens"] += output_tokens
+                    dp_stats["total_latency_sec"] += elapsed
+                self._recent_completions.append({
+                    "finished_at": finished_at,
+                    "provider_key": ctx.provider_key,
+                    "dp_rank": ctx.dp_rank,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": total_tokens,
+                })
+                self._prune_locked(finished_at)
+            else:
+                self.requests_failed += 1
+                provider_stats["requests_failed"] += 1
+                if dp_stats is not None:
+                    dp_stats["requests_failed"] += 1
+
+    def _prune_locked(self, now: float) -> None:
+        cutoff = now - self.throughput_window_sec
+        while self._recent_completions and self._recent_completions[0]["finished_at"] < cutoff:
+            self._recent_completions.popleft()
+
+    def snapshot(self) -> dict:
+        now = time.monotonic()
+        with self._lock:
+            self._prune_locked(now)
+            throughput = self._throughput_from_events(self._recent_completions)
+            providers: dict[str, dict] = {}
+            for provider_key, stats in self._provider_stats.items():
+                provider_events = [e for e in self._recent_completions if e["provider_key"] == provider_key]
+                provider_snapshot = {
+                    "provider_name": stats["provider_name"],
+                    "requests_started": stats["requests_started"],
+                    "requests_completed": stats["requests_completed"],
+                    "requests_failed": stats["requests_failed"],
+                    "streaming_requests_started": stats["streaming_requests_started"],
+                    "non_streaming_requests_started": stats["non_streaming_requests_started"],
+                    "active_requests": stats["active_requests"],
+                    "input_tokens": stats["input_tokens"],
+                    "output_tokens": stats["output_tokens"],
+                    "total_tokens": stats["input_tokens"] + stats["output_tokens"],
+                    "avg_latency_sec": (
+                        stats["total_latency_sec"] / stats["requests_completed"]
+                        if stats["requests_completed"] else 0.0
+                    ),
+                    "throughput": self._throughput_from_events(provider_events),
+                    "per_dp": {},
+                }
+                for dp_rank, dp_stats in stats["per_dp"].items():
+                    dp_events = [
+                        e for e in provider_events
+                        if e["dp_rank"] == dp_rank
+                    ]
+                    provider_snapshot["per_dp"][dp_rank] = {
+                        "requests_started": dp_stats["requests_started"],
+                        "requests_completed": dp_stats["requests_completed"],
+                        "requests_failed": dp_stats["requests_failed"],
+                        "streaming_requests_started": dp_stats["streaming_requests_started"],
+                        "non_streaming_requests_started": dp_stats["non_streaming_requests_started"],
+                        "active_requests": dp_stats["active_requests"],
+                        "input_tokens": dp_stats["input_tokens"],
+                        "output_tokens": dp_stats["output_tokens"],
+                        "total_tokens": dp_stats["input_tokens"] + dp_stats["output_tokens"],
+                        "avg_latency_sec": (
+                            dp_stats["total_latency_sec"] / dp_stats["requests_completed"]
+                            if dp_stats["requests_completed"] else 0.0
+                        ),
+                        "throughput": self._throughput_from_events(dp_events),
+                    }
+                providers[provider_key] = provider_snapshot
+
+            return {
+                "started_at_monotonic": self.started_at,
+                "uptime_sec": max(now - self.started_at, 0.0),
+                "throughput_window_sec": self.throughput_window_sec,
+                "requests_started": self.requests_started,
+                "requests_completed": self.requests_completed,
+                "requests_failed": self.requests_failed,
+                "streaming_requests_started": self.streaming_requests_started,
+                "non_streaming_requests_started": self.non_streaming_requests_started,
+                "active_requests": self.active_requests,
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "total_tokens": self.input_tokens + self.output_tokens,
+                "avg_latency_sec": (
+                    self.total_latency_sec / self.requests_completed
+                    if self.requests_completed else 0.0
+                ),
+                "throughput": throughput,
+                "providers": providers,
+            }
+
+    def _throughput_from_events(self, events) -> dict:
+        total_tokens = sum(int(e["total_tokens"]) for e in events)
+        output_tokens = sum(int(e["output_tokens"]) for e in events)
+        return {
+            "requests_in_window": len(events),
+            "total_tokens_per_sec": total_tokens / self.throughput_window_sec,
+            "output_tokens_per_sec": output_tokens / self.throughput_window_sec,
+        }
+
+
+_runtime_metrics = RuntimeMetrics()
+
+
 def _get_session_ttl(provider: dict) -> float:
     """Get session TTL from provider config, default 3 hours."""
     cfg = provider.get("dp_routing")
@@ -265,6 +518,7 @@ def set_config(cfg: dict) -> None:
     _config = cfg
     _dp_size_cache.clear()
     _dp_allocators.clear()
+    _runtime_metrics.reset()
 
 
 def _build_config_from_env() -> dict | None:
@@ -677,6 +931,36 @@ def _resolve_tokenizer_path(provider: dict) -> str | None:
     )
 
 
+def _normalize_openai_usage(usage: dict | None) -> dict:
+    usage = usage or {}
+    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+    completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+    prompt_details = usage.get("prompt_tokens_details") or {}
+    cache_read = int(prompt_details.get("cached_tokens", 0) or 0)
+    cache_creation = int(prompt_details.get("cache_creation_tokens", 0) or 0)
+    input_tokens = max(prompt_tokens - cache_read - cache_creation, 0)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": completion_tokens,
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_creation,
+    }
+
+
+def _usage_from_anthropic_message(message: dict | None) -> dict | None:
+    if not isinstance(message, dict):
+        return None
+    usage = message.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    return {
+        "input_tokens": int(usage.get("input_tokens", 0) or 0),
+        "output_tokens": int(usage.get("output_tokens", 0) or 0),
+        "cache_read_input_tokens": int(usage.get("cache_read_input_tokens", 0) or 0),
+        "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens", 0) or 0),
+    }
+
+
 def _sglang_tokenize_url(provider: dict) -> str:
     api_base = _api_base(provider).rstrip("/")
     root = api_base.removesuffix("/v1").removesuffix("/")
@@ -754,6 +1038,12 @@ async def messages(request: Request):
     timeout = _timeout()
 
     is_stream = openai_req.get("stream", False)
+    metrics_ctx = _runtime_metrics.start_request(
+        provider_key=_dp_cache_key(provider),
+        provider_name=provider.get("name", ""),
+        dp_rank=dp_decision.rank,
+        is_stream=is_stream,
+    )
 
     if is_stream:
         # Eagerly connect to check provider status before committing to HTTP 200
@@ -770,16 +1060,20 @@ async def messages(request: Request):
                 )
                 try:
                     stream = await open_provider_stream(url, headers, openai_req, timeout, max_retries)
+                    metrics_ctx.dp_rank = dp_decision.rank
                 except ProviderError as retry_exc:
+                    _runtime_metrics.finish_request(metrics_ctx, success=False)
                     raise HTTPException(retry_exc.status or 502, retry_exc.body or str(retry_exc))
             else:
+                _runtime_metrics.finish_request(metrics_ctx, success=False)
                 raise HTTPException(exc.status or 502, exc.body or str(exc))
         except Exception as exc:
             logger.exception("Stream connection error")
+            _runtime_metrics.finish_request(metrics_ctx, success=False)
             raise HTTPException(502, str(exc))
 
         return StreamingResponse(
-            _stream_response(openai_req, stream, model),
+            _stream_response(openai_req, stream, model, metrics_ctx=metrics_ctx),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -803,21 +1097,30 @@ async def messages(request: Request):
                 dp_decision,
             )
             try:
+                metrics_ctx.dp_rank = dp_decision.rank
                 openai_resp = await post_json(
                     url, headers, openai_req, timeout=timeout, max_retries=max_retries
                 )
             except ProviderError as retry_exc:
                 logger.error("Provider error after DP refresh: %s", retry_exc)
+                _runtime_metrics.finish_request(metrics_ctx, success=False)
                 raise HTTPException(retry_exc.status or 502, retry_exc.body or str(retry_exc))
         else:
             logger.error("Provider error: %s", exc)
+            _runtime_metrics.finish_request(metrics_ctx, success=False)
             raise HTTPException(exc.status or 502, exc.body or str(exc))
     except Exception as exc:
         logger.exception("Unexpected error calling provider")
+        _runtime_metrics.finish_request(metrics_ctx, success=False)
         raise HTTPException(502, str(exc))
 
     check_and_save_nonstreaming(openai_req, openai_resp)
     anthropic_resp = openai_to_anthropic(openai_resp, model)
+    _runtime_metrics.finish_request(
+        metrics_ctx,
+        success=True,
+        usage=_usage_from_anthropic_message(anthropic_resp) or _normalize_openai_usage(openai_resp.get("usage")),
+    )
     return JSONResponse(content=anthropic_resp, headers=dp_decision.response_headers())
 
 
@@ -825,15 +1128,27 @@ async def _stream_response(
     openai_req: dict,
     stream: ProviderStream,
     model: str,
+    metrics_ctx: RequestMetricsContext | None = None,
 ) -> AsyncIterator[str]:
     import json as _json
     from debug import is_enabled as _debug_enabled
 
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     _text_buf: list[str] | None = [] if _debug_enabled() else None
+    usage: dict | None = None
+    completed = False
 
     try:
         async for event in stream_openai_to_anthropic(stream, message_id, model):
+            for line in event.split("\n"):
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    parsed = _json.loads(line[6:])
+                except _json.JSONDecodeError:
+                    continue
+                if parsed.get("type") == "message_delta" and isinstance(parsed.get("usage"), dict):
+                    usage = _usage_from_anthropic_message(parsed)
             # Accumulate text for debug check (zero cost when CCR_DEBUG is off)
             if _text_buf is not None:
                 for line in event.split("\n"):
@@ -846,6 +1161,7 @@ async def _stream_response(
                         except _json.JSONDecodeError:
                             pass
             yield event
+        completed = True
     except Exception as exc:
         logger.exception("Streaming error")
         error_event = {
@@ -858,6 +1174,8 @@ async def _stream_response(
         await stream.aclose()
         if _text_buf is not None:
             check_and_save_streaming(openai_req, "".join(_text_buf))
+        if metrics_ctx is not None:
+            _runtime_metrics.finish_request(metrics_ctx, success=completed, usage=usage)
 
 
 # ---------------------------------------------------------------------------
@@ -1338,8 +1656,123 @@ async def batch_results(batch_id: str, request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Health check
+# Metrics + Health check
 # ---------------------------------------------------------------------------
+
+@app.get("/metrics")
+async def metrics():
+    snapshot = _runtime_metrics.snapshot()
+    providers: list[dict] = []
+    configured_providers = {
+        _dp_cache_key(provider): provider
+        for provider in _config.get("Providers", [])
+        if isinstance(provider, dict)
+    }
+
+    for provider_key in sorted(set(configured_providers.keys()) | set(snapshot["providers"].keys())):
+        provider_stats = snapshot["providers"].get(provider_key, {
+            "provider_name": configured_providers.get(provider_key, {}).get("name", ""),
+            "requests_started": 0,
+            "requests_completed": 0,
+            "requests_failed": 0,
+            "streaming_requests_started": 0,
+            "non_streaming_requests_started": 0,
+            "active_requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "avg_latency_sec": 0.0,
+            "throughput": {
+                "requests_in_window": 0,
+                "total_tokens_per_sec": 0.0,
+                "output_tokens_per_sec": 0.0,
+            },
+            "per_dp": {},
+        })
+        provider_cfg = configured_providers.get(provider_key, {})
+        allocator = _dp_allocators.get(provider_key)
+        sessions_per_rank: dict[int, int] = {}
+        total_sessions = 0
+        dp_size = None
+        if allocator is not None:
+            allocator.cleanup()
+            allocator_stats = allocator.stats()
+            total_sessions = int(allocator_stats["total_sessions"])
+            dp_size = int(allocator_stats["dp_size"])
+            sessions_per_rank = {
+                int(rank): int(count)
+                for rank, count in allocator_stats["sessions_per_rank"].items()
+            }
+        elif (cached := _dp_size_cache.get(provider_key)) is not None:
+            dp_size = int(cached["dp_size"])
+
+        per_dp: list[dict] = []
+        known_ranks = sorted(set(provider_stats["per_dp"].keys()) | set(sessions_per_rank.keys()))
+        for rank in known_ranks:
+            dp_stats = provider_stats["per_dp"].get(rank, {})
+            throughput = dp_stats.get("throughput", {})
+            per_dp.append({
+                "rank": rank,
+                "sessions": sessions_per_rank.get(rank, 0),
+                "active_requests": dp_stats.get("active_requests", 0),
+                "requests_started": dp_stats.get("requests_started", 0),
+                "requests_completed": dp_stats.get("requests_completed", 0),
+                "requests_failed": dp_stats.get("requests_failed", 0),
+                "streaming_requests_started": dp_stats.get("streaming_requests_started", 0),
+                "non_streaming_requests_started": dp_stats.get("non_streaming_requests_started", 0),
+                "input_tokens": dp_stats.get("input_tokens", 0),
+                "output_tokens": dp_stats.get("output_tokens", 0),
+                "total_tokens": dp_stats.get("total_tokens", 0),
+                "avg_latency_sec": dp_stats.get("avg_latency_sec", 0.0),
+                "throughput": {
+                    "requests_in_window": throughput.get("requests_in_window", 0),
+                    "total_tokens_per_sec": throughput.get("total_tokens_per_sec", 0.0),
+                    "output_tokens_per_sec": throughput.get("output_tokens_per_sec", 0.0),
+                },
+            })
+
+        providers.append({
+            "provider_key": provider_key,
+            "provider_name": provider_stats["provider_name"],
+            "api_base_url": provider_cfg.get("api_base_url"),
+            "dp_routing_enabled": _dp_routing_config(provider_cfg) is not None,
+            "dp_size": dp_size,
+            "total_sessions": total_sessions,
+            "active_requests": provider_stats["active_requests"],
+            "requests_started": provider_stats["requests_started"],
+            "requests_completed": provider_stats["requests_completed"],
+            "requests_failed": provider_stats["requests_failed"],
+            "streaming_requests_started": provider_stats["streaming_requests_started"],
+            "non_streaming_requests_started": provider_stats["non_streaming_requests_started"],
+            "input_tokens": provider_stats["input_tokens"],
+            "output_tokens": provider_stats["output_tokens"],
+            "total_tokens": provider_stats["total_tokens"],
+            "avg_latency_sec": provider_stats["avg_latency_sec"],
+            "throughput": provider_stats["throughput"],
+            "per_dp": per_dp,
+        })
+
+    return {
+        "status": "ok",
+        "pid": os.getpid(),
+        "uptime_sec": snapshot["uptime_sec"],
+        "throughput_window_sec": snapshot["throughput_window_sec"],
+        "totals": {
+            "active_requests": snapshot["active_requests"],
+            "requests_started": snapshot["requests_started"],
+            "requests_completed": snapshot["requests_completed"],
+            "requests_failed": snapshot["requests_failed"],
+            "streaming_requests_started": snapshot["streaming_requests_started"],
+            "non_streaming_requests_started": snapshot["non_streaming_requests_started"],
+            "input_tokens": snapshot["input_tokens"],
+            "output_tokens": snapshot["output_tokens"],
+            "total_tokens": snapshot["total_tokens"],
+            "avg_latency_sec": snapshot["avg_latency_sec"],
+            "throughput": snapshot["throughput"],
+        },
+        "providers": providers,
+    }
+
 
 @app.get("/health")
 async def health():

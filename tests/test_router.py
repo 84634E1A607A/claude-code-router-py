@@ -1588,6 +1588,168 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
 
 
 # ============================================================================
+# Unit — metrics endpoint
+# ============================================================================
+
+class TestMetricsEndpoint(unittest.IsolatedAsyncioTestCase):
+
+    async def asyncSetUp(self):
+        import server as srv_mod
+
+        self.srv = srv_mod
+        srv_mod.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [{
+                "name": "sglang",
+                "api_base_url": "http://host:8000/v1/chat/completions",
+                "api_key": "k",
+                "max_retries": 1,
+                "dp_routing": {"enabled": True, "server_info_ttl_sec": 30},
+            }],
+            "Router": {"default": "sglang,/model"},
+        })
+
+        from httpx import ASGITransport, AsyncClient
+        self.client = AsyncClient(
+            transport=ASGITransport(app=srv_mod.app),
+            base_url="http://test",
+            timeout=60.0,
+        )
+
+    async def asyncTearDown(self):
+        await self.client.aclose()
+        self.srv.set_config({})
+
+    def _messages_req(self, extra=None):
+        req = {
+            "model": "ignored",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "Reply with exactly: PONG"}],
+        }
+        if extra:
+            req.update(extra)
+        return req
+
+    def _openai_resp(self, text="PONG", prompt_tokens=10, completion_tokens=4):
+        return {
+            "id": "chatcmpl-test",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
+        }
+
+    async def test_metrics_reports_active_requests_and_per_dp_active_requests(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            entered.set()
+            await release.wait()
+            return self._openai_resp()
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            request_task = asyncio.create_task(self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._CLAUDE_SESSION_HEADER: "metrics-session"},
+            ))
+            await entered.wait()
+            metrics_resp = await self.client.get("/metrics")
+            release.set()
+            response = await request_task
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(metrics_resp.status_code, 200, metrics_resp.text)
+        data = metrics_resp.json()
+        self.assertEqual(data["totals"]["active_requests"], 1)
+        provider = data["providers"][0]
+        self.assertEqual(provider["active_requests"], 1)
+        self.assertEqual(provider["per_dp"][0]["rank"], 0)
+        self.assertEqual(provider["per_dp"][0]["active_requests"], 1)
+
+    async def test_metrics_reports_completed_request_throughput_sessions_and_tokens(self):
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
+             patch.object(self.srv, "post_json", new=AsyncMock(return_value=self._openai_resp(completion_tokens=5))):
+            response = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._CLAUDE_SESSION_HEADER: "metrics-session"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        metrics_resp = await self.client.get("/metrics")
+        self.assertEqual(metrics_resp.status_code, 200, metrics_resp.text)
+        data = metrics_resp.json()
+        self.assertEqual(data["totals"]["active_requests"], 0)
+        self.assertEqual(data["totals"]["requests_completed"], 1)
+        self.assertEqual(data["totals"]["input_tokens"], 10)
+        self.assertEqual(data["totals"]["output_tokens"], 5)
+        self.assertGreater(data["totals"]["throughput"]["total_tokens_per_sec"], 0.0)
+
+        provider = data["providers"][0]
+        self.assertEqual(provider["provider_name"], "sglang")
+        self.assertEqual(provider["dp_size"], 4)
+        self.assertEqual(provider["total_sessions"], 1)
+        self.assertEqual(provider["requests_completed"], 1)
+        self.assertEqual(provider["per_dp"][0]["rank"], 0)
+        self.assertEqual(provider["per_dp"][0]["sessions"], 1)
+        self.assertEqual(provider["per_dp"][0]["requests_completed"], 1)
+        self.assertEqual(provider["per_dp"][0]["output_tokens"], 5)
+        self.assertGreater(provider["per_dp"][0]["throughput"]["output_tokens_per_sec"], 0.0)
+
+    async def test_metrics_tracks_streaming_requests(self):
+        class FakeProviderStream:
+            def __init__(self, lines):
+                self._lines = lines
+
+            async def __aiter__(self):
+                for line in self._lines:
+                    yield line.encode()
+
+            async def aclose(self):
+                return None
+
+        stream_lines = [
+            "data: " + json.dumps({
+                "id": "x",
+                "choices": [{"index": 0, "delta": {"content": "PONG"}, "finish_reason": None}],
+            }),
+            "data: " + json.dumps({
+                "id": "x",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 3},
+            }),
+            "data: [DONE]",
+        ]
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
+             patch.object(self.srv, "open_provider_stream", new=AsyncMock(return_value=FakeProviderStream(stream_lines))):
+            response = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req({"stream": True}),
+                headers={
+                    "Accept": "text/event-stream",
+                    self.srv._CLAUDE_SESSION_HEADER: "stream-metrics-session",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        metrics_resp = await self.client.get("/metrics")
+        data = metrics_resp.json()
+        self.assertEqual(data["totals"]["streaming_requests_started"], 1)
+        self.assertEqual(data["totals"]["requests_completed"], 1)
+        provider = data["providers"][0]
+        self.assertEqual(provider["streaming_requests_started"], 1)
+        self.assertEqual(provider["per_dp"][0]["requests_completed"], 1)
+        self.assertEqual(provider["per_dp"][0]["input_tokens"], 12)
+        self.assertEqual(provider["per_dp"][0]["output_tokens"], 3)
+
+
+# ============================================================================
 # Integration tests
 # ============================================================================
 
@@ -1890,7 +2052,9 @@ if __name__ == "__main__":
         for cls in (TestAnthropicToOpenAI, TestOpenAIToAnthropic,
                     TestStreamConverter, TestProviderStreamRetry,
                     TestConfig, TestApplyProviderParams,
-                    TestBatchConversion, TestLegacyPromptParsing, TestURLHelpers):
+                    TestBatchConversion, TestLegacyPromptParsing, TestURLHelpers,
+                    TestDPRoutingHelpers, TestMessagesDPRouting, TestMetricsEndpoint,
+                    TestTokenCounting, TestTokenCountingEndpoint):
             suite.addTests(loader.loadTestsFromTestCase(cls))
 
     if mode in ("integration", "all"):
