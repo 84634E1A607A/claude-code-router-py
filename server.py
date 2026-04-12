@@ -559,11 +559,18 @@ def _build_config_from_env() -> dict | None:
     if params:
         provider["params"] = params
 
-    return {
+    tokenizer_path = os.environ.get("CCR_TOKENIZER_PATH") or os.environ.get("TOKENIZER_PATH")
+    if tokenizer_path:
+        provider["tokenizer_path"] = tokenizer_path
+
+    cfg: dict = {
         "API_TIMEOUT_MS": int(os.environ.get("CCR_API_TIMEOUT_MS", "850000")),
         "Providers": [provider],
         "Router": {"default": f"default,{os.environ.get('CCR_MODEL', '/model')}"},
     }
+    if tokenizer_path:
+        cfg["tokenizer_path"] = tokenizer_path
+    return cfg
 
 
 @asynccontextmanager

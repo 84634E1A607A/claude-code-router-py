@@ -41,12 +41,19 @@ def _build_config(args: argparse.Namespace) -> dict:
     if params:
         provider["params"] = params
 
-    return {
+    tokenizer_path = args.tokenizer_path or os.environ.get("CCR_TOKENIZER_PATH") or os.environ.get("TOKENIZER_PATH")
+    if tokenizer_path:
+        provider["tokenizer_path"] = tokenizer_path
+
+    cfg: dict = {
         "PORT": args.port,
         "API_TIMEOUT_MS": args.api_timeout_ms,
         "Providers": [provider],
         "Router": {"default": f"default,{args.model}"},
     }
+    if tokenizer_path:
+        cfg["tokenizer_path"] = tokenizer_path
+    return cfg
 
 
 def main() -> None:
@@ -80,6 +87,9 @@ def main() -> None:
     parser.add_argument("--max-tokens",  type=int,   default=None)
     parser.add_argument("--budget-tokens", type=int, default=None,
                         help="Reasoning budget tokens (enables thinking mode)")
+    parser.add_argument("--tokenizer-path", default=None, metavar="PATH",
+                        help="HuggingFace tokenizer for /v1/messages/count_tokens "
+                             "(falls back to $CCR_TOKENIZER_PATH or $TOKENIZER_PATH)")
 
     # ── Server ────────────────────────────────────────────────────────────────
     parser.add_argument("--host",          default="0.0.0.0")
