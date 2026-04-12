@@ -26,6 +26,7 @@ def _build_config(args: argparse.Namespace) -> dict:
 
     provider: dict = {
         "name": "default",
+        "model": args.model,
         "api_base_url": args.api_base_url,
         "api_key": args.api_key or os.environ.get("API_KEY", ""),
         "max_retries": args.max_retries,
@@ -49,7 +50,7 @@ def _build_config(args: argparse.Namespace) -> dict:
         "PORT": args.port,
         "API_TIMEOUT_MS": args.api_timeout_ms,
         "Providers": [provider],
-        "Router": {"default": f"default,{args.model}"},
+        "Router": {"default": args.model},
     }
     if tokenizer_path:
         cfg["tokenizer_path"] = tokenizer_path

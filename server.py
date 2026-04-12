@@ -16,7 +16,7 @@ import zlib
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from batch import anthropic_batch_to_openai_jsonl, openai_batch_to_anthropic, openai_results_line_to_anthropic
 from client import ProviderError, ProviderStream, close_shared_client, get_shared_client, open_provider_stream, post_json
-from config import apply_provider_params, get_provider, load_config, resolve_route
+from config import apply_provider_params, get_provider, load_config, resolve_route, validate_config
 from converter import anthropic_to_openai, openai_to_anthropic, stream_openai_to_anthropic
 from debug import check_and_save_nonstreaming, check_and_save_streaming, log_openai_request
 
@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 # Populated either by set_config() (single-process) or lifespan (multi-worker).
 _config: dict = {}
 _dp_size_cache: dict[str, dict[str, float | int]] = {}
+_providers_by_model: dict[str, list[dict]] = {}
+_available_models: tuple[str, ...] = ()
 
 _CLAUDE_SESSION_HEADER = "X-Claude-Code-Session-Id"
 _DP_OVERRIDE_HEADER = "X-Routed-DP-Rank"
@@ -43,8 +45,11 @@ _WHITESPACE_RE = re.compile(r"\s+")
 
 @dataclass
 class DPRoutingDecision:
+    provider_key: str | None = None
+    provider_name: str | None = None
     dp_size: int | None = None
     rank: int | None = None
+    provider_dp_rank: int | None = None
     source: str | None = None
     sticky_key: str | None = None
     session_id: str | None = None
@@ -54,55 +59,60 @@ class DPRoutingDecision:
         headers: dict[str, str] = {}
         if self.rank is not None:
             headers["X-Router-DP-Rank"] = str(self.rank)
+        if self.provider_name:
+            headers["X-Router-Provider"] = self.provider_name
+        if self.provider_dp_rank is not None:
+            headers["X-Router-Provider-DP-Rank"] = str(self.provider_dp_rank)
         if self.source in {"session", "session_system"} and self.sticky_key:
             headers["X-Router-Sticky-Key"] = self.sticky_key
         return headers
 
 
 @dataclass
-class DPAllocator:
-    """Manages session-to-DP-rank mapping with round-robin allocation.
+class StickySlotAllocator:
+    """Manages sticky session-to-slot mapping with round-robin allocation.
 
     Key properties:
     - Sessions are sticky forever (once assigned, never reassigned)
-    - Multiple sessions can share the same DP rank
-    - New sessions get the DP rank with longest idle time
+    - Multiple sessions can share the same slot
+    - New sessions get the slot with longest idle time
     - Sessions evicted after TTL of inactivity
     """
-    dp_size: int
+    slots: list[str]
     ttl_sec: float = 10800.0  # 3 hours default
-    sessions: dict[str, int] = field(default_factory=dict)  # session_id -> dp_rank
-    rank_last_used: dict[int, float] = field(default_factory=dict)  # dp_rank -> timestamp
-    session_activity: dict[str, float] = field(default_factory=dict)  # session_id -> timestamp
+    sessions: dict[str, str] = field(default_factory=dict)  # sticky_key -> slot_id
+    slot_last_used: dict[str, float] = field(default_factory=dict)  # slot_id -> timestamp
+    session_activity: dict[str, float] = field(default_factory=dict)  # sticky_key -> timestamp
 
-    def assign(self, session_id: str) -> tuple[int, bool]:
-        """Assign a DP rank to a session.
+    def assign(self, sticky_key: str) -> tuple[str, bool]:
+        """Assign a slot to a sticky key.
 
-        Returns (rank, is_new) where is_new is True if this was a new assignment.
+        Returns (slot_id, is_new) where is_new is True if this was a new assignment.
         Performs lazy cleanup of expired sessions before assigning a new one.
         """
         now = time.monotonic()
+        valid_slots = set(self.slots)
 
-        # Check if session already has a rank (sticky forever)
-        if session_id in self.sessions:
-            rank = self.sessions[session_id]
-            self.session_activity[session_id] = now
-            return rank, False
+        current_slot = self.sessions.get(sticky_key)
+        if current_slot in valid_slots:
+            self.session_activity[sticky_key] = now
+            return current_slot, False
 
-        # Lazy cleanup: evict expired sessions before assigning a new one
+        if current_slot is not None:
+            self.sessions.pop(sticky_key, None)
+            self.session_activity.pop(sticky_key, None)
+
         evicted = self._cleanup(now)
         if evicted > 0:
             logger.debug("DP lazy cleanup: evicted=%d sessions remaining=%d", evicted, len(self.sessions))
 
-        # Find the best rank for new session
-        rank = self._select_rank()
+        slot_id = self._select_slot()
 
-        # Record the assignment
-        self.sessions[session_id] = rank
-        self.rank_last_used[rank] = now
-        self.session_activity[session_id] = now
+        self.sessions[sticky_key] = slot_id
+        self.slot_last_used[slot_id] = now
+        self.session_activity[sticky_key] = now
 
-        return rank, True
+        return slot_id, True
 
     def _cleanup(self, now: float) -> int:
         """Evict sessions inactive for > TTL. Returns count of evicted sessions."""
@@ -114,28 +124,30 @@ class DPAllocator:
         for sid in to_evict:
             self.sessions.pop(sid, None)
             self.session_activity.pop(sid, None)
-            # Note: we don't remove from rank_last_used - that tracks DP usage history
+        self.slot_last_used = {
+            slot_id: last_used
+            for slot_id, last_used in self.slot_last_used.items()
+            if slot_id in self.slots
+        }
 
         return len(to_evict)
 
-    def _select_rank(self) -> int:
-        """Select the best DP rank for a new session."""
-        # If not all ranks have been used, pick the next unused one (round-robin)
-        used_ranks = set(self.rank_last_used.keys())
-        if len(used_ranks) < self.dp_size:
-            for r in range(self.dp_size):
-                if r not in used_ranks:
-                    return r
+    def _select_slot(self) -> str:
+        """Select the best slot for a new sticky key."""
+        used_slots = set(self.slot_last_used.keys())
+        if len(used_slots) < len(self.slots):
+            for slot_id in self.slots:
+                if slot_id not in used_slots:
+                    return slot_id
 
-        # All ranks have been used, pick the one with longest idle time
         oldest_time = None
-        oldest_rank = 0
-        for r in range(self.dp_size):
-            last_used = self.rank_last_used.get(r, 0.0)
+        oldest_slot = self.slots[0]
+        for slot_id in self.slots:
+            last_used = self.slot_last_used.get(slot_id, 0.0)
             if oldest_time is None or last_used < oldest_time:
                 oldest_time = last_used
-                oldest_rank = r
-        return oldest_rank
+                oldest_slot = slot_id
+        return oldest_slot
 
     def cleanup(self) -> int:
         """Public cleanup method for external use. Evicts expired sessions."""
@@ -143,19 +155,56 @@ class DPAllocator:
 
     def stats(self) -> dict:
         """Return allocation statistics for logging/debugging."""
-        rank_session_counts: dict[int, int] = {}
-        for rank in self.sessions.values():
-            rank_session_counts[rank] = rank_session_counts.get(rank, 0) + 1
+        sessions_per_slot: dict[str, int] = {}
+        for slot_id in self.sessions.values():
+            sessions_per_slot[slot_id] = sessions_per_slot.get(slot_id, 0) + 1
+        return {
+            "slot_count": len(self.slots),
+            "total_sessions": len(self.sessions),
+            "slots_in_use": len(sessions_per_slot),
+            "sessions_per_slot": sessions_per_slot,
+        }
+
+
+@dataclass
+class DPAllocator:
+    """Backward-compatible wrapper for integer DP ranks."""
+    dp_size: int
+    ttl_sec: float = 10800.0
+    _allocator: StickySlotAllocator = field(init=False)
+
+    def __post_init__(self) -> None:
+        self._allocator = StickySlotAllocator(
+            slots=[str(rank) for rank in range(self.dp_size)],
+            ttl_sec=self.ttl_sec,
+        )
+
+    @property
+    def sessions(self) -> dict[str, int]:
+        return {sid: int(rank) for sid, rank in self._allocator.sessions.items()}
+
+    def assign(self, session_id: str) -> tuple[int, bool]:
+        slot_id, is_new = self._allocator.assign(session_id)
+        return int(slot_id), is_new
+
+    def cleanup(self) -> int:
+        return self._allocator.cleanup()
+
+    def stats(self) -> dict:
+        base = self._allocator.stats()
         return {
             "dp_size": self.dp_size,
-            "total_sessions": len(self.sessions),
-            "ranks_in_use": len(rank_session_counts),
-            "sessions_per_rank": rank_session_counts,
+            "total_sessions": base["total_sessions"],
+            "ranks_in_use": base["slots_in_use"],
+            "sessions_per_rank": {
+                int(rank): count for rank, count in base["sessions_per_slot"].items()
+            },
         }
 
 
 # Global allocator state per provider
 _dp_allocators: dict[str, DPAllocator] = {}
+_model_allocators: dict[str, StickySlotAllocator] = {}
 
 
 @dataclass
@@ -486,14 +535,13 @@ def _extract_subagent_hash_input(req: dict) -> str | None:
     return text
 
 
-def _derive_dp_sticky_key(session_id: str, provider: dict, anthropic_req: dict) -> tuple[str, str, str | None]:
-    """Build the sticky key used for DP routing.
+def _derive_sticky_key(session_id: str, sticky_mode: str, anthropic_req: dict) -> tuple[str, str, str | None]:
+    """Build the sticky key used for sticky provider/DP routing.
 
     `session_system` mode prefers a hash of `messages[0].content[1]` when that
     block is present and otherwise falls back to a normalized system-prompt hash.
     """
-    mode = _get_dp_sticky_mode(provider)
-    if mode != "session_system":
+    if sticky_mode != "session_system":
         return session_id, "session", None
 
     subagent_hash_input = _extract_subagent_hash_input(anthropic_req)
@@ -513,11 +561,30 @@ def _derive_dp_sticky_key(session_id: str, provider: dict, anthropic_req: dict) 
     return f"{session_id}:{digest}", "session_system", None
 
 
+def _derive_dp_sticky_key(session_id: str, provider: dict, anthropic_req: dict) -> tuple[str, str, str | None]:
+    """Backward-compatible wrapper around the generic sticky-key helper."""
+    return _derive_sticky_key(session_id, _get_dp_sticky_mode(provider), anthropic_req)
+
+
 def set_config(cfg: dict) -> None:
-    global _config
-    _config = cfg
+    global _config, _providers_by_model, _available_models
+    _config = validate_config(cfg) if cfg else cfg
+    _providers_by_model = {}
+    _available_models = ()
+    if _config:
+        grouped: dict[str, list[dict]] = {}
+        for provider in _config.get("Providers", []):
+            if not isinstance(provider, dict):
+                continue
+            model = str(provider.get("model", "")).strip()
+            if not model:
+                continue
+            grouped.setdefault(model, []).append(provider)
+        _providers_by_model = grouped
+        _available_models = tuple(sorted(grouped.keys()))
     _dp_size_cache.clear()
     _dp_allocators.clear()
+    _model_allocators.clear()
     _runtime_metrics.reset()
 
 
@@ -540,6 +607,7 @@ def _build_config_from_env() -> dict | None:
 
     provider: dict = {
         "name": "default",
+        "model": os.environ.get("CCR_MODEL", "/model"),
         "api_base_url": api_base_url,
         "api_key": os.environ.get("CCR_API_KEY") or os.environ.get("API_KEY", ""),
         "max_retries": int(os.environ.get("CCR_MAX_RETRIES", "3")),
@@ -566,7 +634,7 @@ def _build_config_from_env() -> dict | None:
     cfg: dict = {
         "API_TIMEOUT_MS": int(os.environ.get("CCR_API_TIMEOUT_MS", "850000")),
         "Providers": [provider],
-        "Router": {"default": f"default,{os.environ.get('CCR_MODEL', '/model')}"},
+        "Router": {"default": provider["model"]},
     }
     if tokenizer_path:
         cfg["tokenizer_path"] = tokenizer_path
@@ -580,12 +648,12 @@ async def lifespan(app: FastAPI):
         if inline := os.environ.get("CCR_CONFIG_JSON"):
             import json as _json
             try:
-                _config = _json.loads(inline)
+                _config = validate_config(_json.loads(inline))
                 logger.info("Config loaded from CCR_CONFIG_JSON (worker pid=%d)", os.getpid())
             except Exception as exc:
                 logger.error("Failed to parse CCR_CONFIG_JSON: %s", exc)
         elif cfg := _build_config_from_env():
-            _config = cfg
+            _config = validate_config(cfg)
             logger.info("Config loaded from CCR_* env vars (worker pid=%d)", os.getpid())
         else:
             path = os.environ.get("CCR_CONFIG", "config.json")
@@ -620,18 +688,182 @@ def _provider_headers(provider: dict) -> dict:
     return headers
 
 
-def _get_provider(anthropic_req: dict = None):
-    """Determine which provider + model to use and return (provider, model, url)."""
-    route = resolve_route(_config)
-    if route is None:
-        raise HTTPException(500, "No default route configured")
+@dataclass(frozen=True)
+class ProviderTarget:
+    provider: dict
+    model: str
+    url: str
 
-    provider_name, model = route
-    provider = get_provider(_config, provider_name)
-    if provider is None:
-        raise HTTPException(500, f"Provider '{provider_name}' not found in config")
 
-    return provider, model, provider["api_base_url"]
+@dataclass(frozen=True)
+class RoutingSlot:
+    flat_index: int
+    slot_id: str
+    provider: dict
+    provider_key: str
+    provider_name: str
+    model: str
+    provider_dp_rank: int | None
+    dp_size: int | None
+
+
+def _resolve_routed_model(scenario: str = "default") -> str:
+    model = resolve_route(_config, scenario)
+    if model is None:
+        raise HTTPException(500, f"No route configured for scenario '{scenario}'")
+    return model
+
+
+def _resolve_model_alias(alias: str) -> str | None:
+    router = _config.get("Router", {})
+    target = router.get(alias)
+    if not isinstance(target, str):
+        return None
+    target = target.strip()
+    return target or None
+
+
+def _providers_for_model(model: str) -> list[dict]:
+    providers = _providers_by_model.get(model)
+    if not providers:
+        raise HTTPException(500, f"No providers configured for model '{model}'")
+    return providers
+
+
+def _resolve_request_model(requested_model: str | None, scenario: str = "default") -> str:
+    requested = str(requested_model or "").strip()
+    if not requested:
+        return _resolve_routed_model(scenario)
+
+    alias_target = _resolve_model_alias(requested)
+    if alias_target is not None:
+        return alias_target
+    if requested in _providers_by_model:
+        return requested
+    available = ", ".join(_available_models) if _available_models else "<none>"
+    raise HTTPException(400, f"Unknown model '{requested}'. Available models: {available}")
+
+
+def _select_deterministic_provider(model: str) -> ProviderTarget:
+    provider = _providers_for_model(model)[0]
+    return ProviderTarget(provider=provider, model=model, url=provider["api_base_url"])
+
+
+def _provider_pool_key(model: str) -> str:
+    return f"model:{model}"
+
+
+def _provider_slot_id(provider: dict, dp_rank: int | None) -> str:
+    provider_key = _dp_cache_key(provider)
+    if dp_rank is None:
+        return provider_key
+    return f"{provider_key}:{dp_rank}"
+
+
+def _slot_belongs_to_provider(slot_id: str, provider_key: str) -> bool:
+    return slot_id == provider_key or slot_id.startswith(provider_key + ":")
+
+
+def _slot_rank_for_provider(slot_id: str, provider_key: str) -> int | None:
+    if slot_id == provider_key:
+        return None
+    prefix = provider_key + ":"
+    if not slot_id.startswith(prefix):
+        return None
+    suffix = slot_id[len(prefix):]
+    try:
+        return int(suffix)
+    except ValueError:
+        return None
+
+
+def _slot_ttl_for_providers(providers: list[dict]) -> float:
+    dp_enabled = [provider for provider in providers if _dp_routing_config(provider) is not None]
+    if not dp_enabled:
+        return 10800.0
+    ttl = _get_session_ttl(dp_enabled[0])
+    for provider in dp_enabled[1:]:
+        if _get_session_ttl(provider) != ttl:
+            raise HTTPException(500, "All DP-enabled providers for a model must share session_ttl_sec")
+    return ttl
+
+
+def _slot_sticky_mode_for_providers(providers: list[dict]) -> str:
+    dp_enabled = [provider for provider in providers if _dp_routing_config(provider) is not None]
+    if not dp_enabled:
+        return "session"
+    mode = _get_dp_sticky_mode(dp_enabled[0])
+    for provider in dp_enabled[1:]:
+        if _get_dp_sticky_mode(provider) != mode:
+            raise HTTPException(500, "All DP-enabled providers for a model must share sticky_mode")
+    return mode
+
+
+async def _build_routing_slots(model: str, *, force_refresh: bool = False) -> list[RoutingSlot]:
+    providers = _providers_for_model(model)
+    slots: list[RoutingSlot] = []
+    flat_index = 0
+    for provider in providers:
+        provider_key = _dp_cache_key(provider)
+        provider_name = provider.get("name", "")
+        synthetic_dp_rank = 0 if len(providers) == 1 else None
+        dp_size = None
+        if _dp_routing_config(provider) is not None:
+            dp_size = await _get_provider_dp_size(provider, force_refresh=force_refresh)
+            if dp_size is not None:
+                _dp_size_cache[provider_key] = {"dp_size": dp_size, "fetched_at": time.monotonic()}
+        if dp_size is not None and dp_size > 1:
+            for provider_dp_rank in range(dp_size):
+                slots.append(RoutingSlot(
+                    flat_index=flat_index,
+                    slot_id=_provider_slot_id(provider, provider_dp_rank),
+                    provider=provider,
+                    provider_key=provider_key,
+                    provider_name=provider_name,
+                    model=model,
+                    provider_dp_rank=provider_dp_rank,
+                    dp_size=dp_size,
+                ))
+                flat_index += 1
+            continue
+        slots.append(RoutingSlot(
+            flat_index=flat_index,
+            slot_id=_provider_slot_id(provider, synthetic_dp_rank),
+            provider=provider,
+            provider_key=provider_key,
+            provider_name=provider_name,
+            model=model,
+            provider_dp_rank=synthetic_dp_rank,
+            dp_size=1 if synthetic_dp_rank is not None else dp_size,
+        ))
+        flat_index += 1
+    return slots
+
+
+def _get_or_create_model_allocator(model: str, slots: list[RoutingSlot]) -> StickySlotAllocator:
+    if not slots:
+        raise HTTPException(500, f"No routing slots available for model '{model}'")
+    allocator_key = _provider_pool_key(model)
+    ttl = _slot_ttl_for_providers([slot.provider for slot in slots])
+    slot_ids = [slot.slot_id for slot in slots]
+    allocator = _model_allocators.get(allocator_key)
+    if allocator is None or allocator.ttl_sec != ttl or allocator.slots != slot_ids:
+        allocator = StickySlotAllocator(slots=slot_ids, ttl_sec=ttl)
+        if allocator_key in _model_allocators:
+            allocator.sessions.update(_model_allocators[allocator_key].sessions)
+            allocator.session_activity.update(_model_allocators[allocator_key].session_activity)
+            allocator.slot_last_used.update({
+                slot_id: ts for slot_id, ts in _model_allocators[allocator_key].slot_last_used.items()
+                if slot_id in slot_ids
+            })
+        _model_allocators[allocator_key] = allocator
+        logger.info(
+            "Created model allocator for model=%s slot_count=%d ttl_sec=%.0f",
+            model,
+            len(slot_ids),
+            ttl,
+        )
+    return allocator
 
 
 def _api_base(provider: dict) -> str:
@@ -792,83 +1024,104 @@ def _log_dp_routing(provider: dict, decision: DPRoutingDecision, remapped: bool 
 
 async def _resolve_dp_routing(
     request: Request,
-    provider: dict,
+    model: str,
     anthropic_req: dict,
     base_openai_req: dict,
     force_refresh: bool = False,
-) -> tuple[dict, DPRoutingDecision]:
+) -> tuple[RoutingSlot, dict, DPRoutingDecision]:
     openai_req = dict(base_openai_req)
-    if _dp_routing_config(provider) is None:
-        return openai_req, DPRoutingDecision()
-
-    dp_size = await _get_provider_dp_size(provider, force_refresh=force_refresh)
-    decision = DPRoutingDecision(dp_size=dp_size)
-    if dp_size is None or dp_size <= 1:
-        return openai_req, decision
+    slots = await _build_routing_slots(model, force_refresh=force_refresh)
+    if not slots:
+        raise HTTPException(500, f"No routing slots available for model '{model}'")
+    slot_by_id = {slot.slot_id: slot for slot in slots}
 
     override_rank = request.headers.get(_DP_OVERRIDE_HEADER)
     if override_rank is not None:
         try:
-            rank = int(override_rank.strip())
+            flat_rank = int(override_rank.strip())
         except ValueError:
             raise HTTPException(400, f"{_DP_OVERRIDE_HEADER} must be an integer")
-        if rank < 0 or rank >= dp_size:
-            raise HTTPException(400, f"{_DP_OVERRIDE_HEADER} must be in range [0, {dp_size})")
-        openai_req["routed_dp_rank"] = rank
-        decision.rank = rank
-        decision.source = "override"
-        return openai_req, decision
+        if flat_rank < 0 or flat_rank >= len(slots):
+            raise HTTPException(400, f"{_DP_OVERRIDE_HEADER} must be in range [0, {len(slots)})")
+        selected_slot = slots[flat_rank]
+        if selected_slot.provider_dp_rank is not None:
+            openai_req["routed_dp_rank"] = selected_slot.provider_dp_rank
+        decision = DPRoutingDecision(
+            provider_key=selected_slot.provider_key,
+            provider_name=selected_slot.provider_name,
+            dp_size=selected_slot.dp_size,
+            rank=selected_slot.flat_index,
+            provider_dp_rank=selected_slot.provider_dp_rank,
+            source="override",
+        )
+        return selected_slot, openai_req, decision
 
-    # Get or generate session ID
     session_id = request.headers.get(_CLAUDE_SESSION_HEADER)
     if not session_id:
         session_id = str(uuid.uuid4())
 
-    sticky_key, sticky_source, subagent_id = _derive_dp_sticky_key(session_id, provider, anthropic_req)
+    sticky_mode = _slot_sticky_mode_for_providers([slot.provider for slot in slots])
+    sticky_key, sticky_source, subagent_id = _derive_sticky_key(session_id, sticky_mode, anthropic_req)
 
-    # Use allocator for round-robin assignment (with lazy cleanup)
-    allocator = _get_or_create_allocator(provider, dp_size)
-    rank, is_new = allocator.assign(sticky_key)
-    openai_req["routed_dp_rank"] = rank
-    decision.rank = rank
-    decision.source = sticky_source
-    decision.sticky_key = sticky_key
-    decision.session_id = session_id
-    decision.subagent_id = subagent_id
+    allocator = _get_or_create_model_allocator(model, slots)
+    slot_id, is_new = allocator.assign(sticky_key)
+    selected_slot = slot_by_id.get(slot_id)
+    if selected_slot is None:
+        allocator.sessions.pop(sticky_key, None)
+        allocator.session_activity.pop(sticky_key, None)
+        slot_id, is_new = allocator.assign(sticky_key)
+        selected_slot = slot_by_id[slot_id]
 
-    # Log session assignment
+    if selected_slot.provider_dp_rank is not None:
+        openai_req["routed_dp_rank"] = selected_slot.provider_dp_rank
+    decision = DPRoutingDecision(
+        provider_key=selected_slot.provider_key,
+        provider_name=selected_slot.provider_name,
+        dp_size=selected_slot.dp_size,
+        rank=selected_slot.flat_index,
+        provider_dp_rank=selected_slot.provider_dp_rank,
+        source=sticky_source,
+        sticky_key=sticky_key,
+        session_id=session_id,
+        subagent_id=subagent_id,
+    )
+
     logger.info(
-        "DP assign: session=%s subagent_id=%s sticky_source=%s rank=%d is_new=%s total_sessions=%d",
+        "Routing assign: model=%s provider=%s session=%s subagent_id=%s sticky_source=%s slot=%d provider_dp_rank=%s is_new=%s total_sessions=%d",
+        model,
+        selected_slot.provider_name,
         session_id[:8] + "..." if len(session_id) > 8 else session_id,
         subagent_id,
         sticky_source,
-        rank,
+        selected_slot.flat_index,
+        selected_slot.provider_dp_rank,
         is_new,
         len(allocator.sessions),
     )
 
-    return openai_req, decision
+    return selected_slot, openai_req, decision
 
 
 async def _retry_message_request_for_invalid_rank(
     request: Request,
-    provider: dict,
+    model: str,
     anthropic_req: dict,
     base_openai_req: dict,
     old_decision: DPRoutingDecision,
-) -> tuple[dict, DPRoutingDecision]:
-    openai_req, new_decision = await _resolve_dp_routing(
+) -> tuple[RoutingSlot, dict, DPRoutingDecision]:
+    selected_slot, openai_req, new_decision = await _resolve_dp_routing(
         request,
-        provider,
+        model,
         anthropic_req,
         base_openai_req,
         force_refresh=True,
     )
-    if old_decision.source == "override" and (new_decision.dp_size or 0) > 1 and new_decision.rank is None:
-        raise HTTPException(400, f"{_DP_OVERRIDE_HEADER} must be in range [0, {new_decision.dp_size})")
-    _log_dp_routing(provider, new_decision, remapped=(new_decision.rank != old_decision.rank))
+    if old_decision.source == "override" and new_decision.rank is None:
+        raise HTTPException(400, f"{_DP_OVERRIDE_HEADER} is no longer valid after refreshing routing slots")
+    openai_req = apply_provider_params(selected_slot.provider, openai_req)
+    _log_dp_routing(selected_slot.provider, new_decision, remapped=(new_decision.rank != old_decision.rank))
     log_openai_request(openai_req)
-    return openai_req, new_decision
+    return selected_slot, openai_req, new_decision
 
 
 _tokenizer_cache: dict[str, object] = {}  # tokenizer_path → tokenizer
@@ -1022,7 +1275,7 @@ async def messages(request: Request):
         raise HTTPException(400, "Invalid JSON body")
 
     try:
-        provider, model, url = _get_provider(body)
+        model = _resolve_request_model((body or {}).get("model"))
     except HTTPException:
         raise
     except Exception as exc:
@@ -1035,8 +1288,11 @@ async def messages(request: Request):
 
     # Anthropic → OpenAI, then apply provider param defaults
     base_openai_req = anthropic_to_openai(body)
+    selected_slot, openai_req, dp_decision = await _resolve_dp_routing(request, model, body, base_openai_req)
+    provider = selected_slot.provider
+    url = provider["api_base_url"]
     base_openai_req = apply_provider_params(provider, base_openai_req)
-    openai_req, dp_decision = await _resolve_dp_routing(request, provider, body, base_openai_req)
+    openai_req = apply_provider_params(provider, openai_req)
     _log_dp_routing(provider, dp_decision)
     log_openai_request(openai_req)
 
@@ -1048,7 +1304,7 @@ async def messages(request: Request):
     metrics_ctx = _runtime_metrics.start_request(
         provider_key=_dp_cache_key(provider),
         provider_name=provider.get("name", ""),
-        dp_rank=dp_decision.rank,
+        dp_rank=dp_decision.provider_dp_rank,
         is_stream=is_stream,
     )
 
@@ -1058,16 +1314,21 @@ async def messages(request: Request):
             stream = await open_provider_stream(url, headers, openai_req, timeout, max_retries)
         except ProviderError as exc:
             if _is_invalid_dp_rank_error(exc) and dp_decision.rank is not None:
-                openai_req, dp_decision = await _retry_message_request_for_invalid_rank(
+                selected_slot, openai_req, dp_decision = await _retry_message_request_for_invalid_rank(
                     request,
-                    provider,
+                    model,
                     body,
                     base_openai_req,
                     dp_decision,
                 )
+                provider = selected_slot.provider
+                url = provider["api_base_url"]
+                headers = _provider_headers(provider)
                 try:
                     stream = await open_provider_stream(url, headers, openai_req, timeout, max_retries)
-                    metrics_ctx.dp_rank = dp_decision.rank
+                    metrics_ctx.provider_key = _dp_cache_key(provider)
+                    metrics_ctx.provider_name = provider.get("name", "")
+                    metrics_ctx.dp_rank = dp_decision.provider_dp_rank
                 except ProviderError as retry_exc:
                     _runtime_metrics.finish_request(metrics_ctx, success=False)
                     raise HTTPException(retry_exc.status or 502, retry_exc.body or str(retry_exc))
@@ -1096,15 +1357,20 @@ async def messages(request: Request):
         )
     except ProviderError as exc:
         if _is_invalid_dp_rank_error(exc) and dp_decision.rank is not None:
-            openai_req, dp_decision = await _retry_message_request_for_invalid_rank(
+            selected_slot, openai_req, dp_decision = await _retry_message_request_for_invalid_rank(
                 request,
-                provider,
+                model,
                 body,
                 base_openai_req,
                 dp_decision,
             )
+            provider = selected_slot.provider
+            url = provider["api_base_url"]
+            headers = _provider_headers(provider)
             try:
-                metrics_ctx.dp_rank = dp_decision.rank
+                metrics_ctx.provider_key = _dp_cache_key(provider)
+                metrics_ctx.provider_name = provider.get("name", "")
+                metrics_ctx.dp_rank = dp_decision.provider_dp_rank
                 openai_resp = await post_json(
                     url, headers, openai_req, timeout=timeout, max_retries=max_retries
                 )
@@ -1197,7 +1463,9 @@ async def count_tokens(request: Request):
         raise HTTPException(400, "Invalid JSON body")
 
     try:
-        provider, model, _ = _get_provider()
+        model = _resolve_request_model((body or {}).get("model"))
+        target = _select_deterministic_provider(model)
+        provider = target.provider
     except HTTPException:
         raise
 
@@ -1232,7 +1500,8 @@ async def count_tokens(request: Request):
 async def tokens_clear(request: Request):
     """Proxy /tokens/clear to the upstream chat_to_generate_adapter."""
     body = await request.json()
-    provider, model, _ = _get_provider()
+    model = _resolve_routed_model()
+    provider = _select_deterministic_provider(model).provider
     api_base = _api_base(provider)
     # Strip /v1 (with or without trailing slash) to get the adapter root
     adapter_root = api_base.removesuffix("/v1").removesuffix("/")
@@ -1278,7 +1547,8 @@ async def list_models(before_id: str | None = None,
                       after_id: str | None = None,
                       limit: int = 20):
     try:
-        provider, _, _ = _get_provider()
+        model = _resolve_routed_model()
+        provider = _select_deterministic_provider(model).provider
     except HTTPException:
         raise
 
@@ -1315,7 +1585,8 @@ async def list_models(before_id: str | None = None,
 @app.get("/v1/models/{model_id:path}")
 async def get_model(model_id: str):
     try:
-        provider, _, _ = _get_provider()
+        model = _resolve_routed_model()
+        provider = _select_deterministic_provider(model).provider
     except HTTPException:
         raise
 
@@ -1380,7 +1651,10 @@ async def legacy_complete(request: Request):
         raise HTTPException(400, "Invalid JSON body")
 
     try:
-        provider, model, url = _get_provider()
+        model = _resolve_request_model(body.get("model"))
+        target = _select_deterministic_provider(model)
+        provider = target.provider
+        url = target.url
     except HTTPException:
         raise
 
@@ -1455,7 +1729,8 @@ async def create_batch(request: Request):
         raise HTTPException(400, "Invalid JSON body")
 
     try:
-        provider, model, _ = _get_provider()
+        model = _resolve_routed_model()
+        provider = _select_deterministic_provider(model).provider
     except HTTPException:
         raise
 
@@ -1506,7 +1781,8 @@ async def list_batches(request: Request,
                        after_id: str | None = None,
                        limit: int = 20):
     try:
-        provider, _, _ = _get_provider()
+        model = _resolve_routed_model()
+        provider = _select_deterministic_provider(model).provider
     except HTTPException:
         raise
 
@@ -1540,7 +1816,8 @@ async def list_batches(request: Request,
 @app.get("/v1/messages/batches/{batch_id}")
 async def get_batch(batch_id: str, request: Request):
     try:
-        provider, _, _ = _get_provider()
+        model = _resolve_routed_model()
+        provider = _select_deterministic_provider(model).provider
     except HTTPException:
         raise
 
@@ -1561,7 +1838,8 @@ async def get_batch(batch_id: str, request: Request):
 @app.post("/v1/messages/batches/{batch_id}/cancel")
 async def cancel_batch(batch_id: str, request: Request):
     try:
-        provider, _, _ = _get_provider()
+        model = _resolve_routed_model()
+        provider = _select_deterministic_provider(model).provider
     except HTTPException:
         raise
 
@@ -1590,7 +1868,8 @@ async def cancel_batch(batch_id: str, request: Request):
 @app.delete("/v1/messages/batches/{batch_id}")
 async def delete_batch(batch_id: str):
     try:
-        provider, _, _ = _get_provider()
+        model = _resolve_routed_model()
+        provider = _select_deterministic_provider(model).provider
     except HTTPException:
         raise
 
@@ -1612,7 +1891,8 @@ async def delete_batch(batch_id: str):
 async def batch_results(batch_id: str, request: Request):
     """Stream batch results as Anthropic JSONL (one result per line)."""
     try:
-        provider, model, _ = _get_provider()
+        model = _resolve_routed_model()
+        provider = _select_deterministic_provider(model).provider
     except HTTPException:
         raise
 
@@ -1675,6 +1955,20 @@ async def metrics():
         for provider in _config.get("Providers", [])
         if isinstance(provider, dict)
     }
+    sessions_by_provider: dict[str, int] = {}
+    sessions_by_provider_rank: dict[str, dict[int, int]] = {}
+    for allocator in _model_allocators.values():
+        allocator.cleanup()
+        for slot_id, count in allocator.stats()["sessions_per_slot"].items():
+            for provider_key in configured_providers:
+                if not _slot_belongs_to_provider(slot_id, provider_key):
+                    continue
+                sessions_by_provider[provider_key] = sessions_by_provider.get(provider_key, 0) + int(count)
+                rank = _slot_rank_for_provider(slot_id, provider_key)
+                if rank is not None:
+                    per_rank = sessions_by_provider_rank.setdefault(provider_key, {})
+                    per_rank[rank] = per_rank.get(rank, 0) + int(count)
+                break
 
     for provider_key in sorted(set(configured_providers.keys()) | set(snapshot["providers"].keys())):
         provider_stats = snapshot["providers"].get(provider_key, {
@@ -1697,21 +1991,13 @@ async def metrics():
             "per_dp": {},
         })
         provider_cfg = configured_providers.get(provider_key, {})
-        allocator = _dp_allocators.get(provider_key)
-        sessions_per_rank: dict[int, int] = {}
-        total_sessions = 0
+        sessions_per_rank: dict[int, int] = sessions_by_provider_rank.get(provider_key, {})
+        total_sessions = sessions_by_provider.get(provider_key, 0)
         dp_size = None
-        if allocator is not None:
-            allocator.cleanup()
-            allocator_stats = allocator.stats()
-            total_sessions = int(allocator_stats["total_sessions"])
-            dp_size = int(allocator_stats["dp_size"])
-            sessions_per_rank = {
-                int(rank): int(count)
-                for rank, count in allocator_stats["sessions_per_rank"].items()
-            }
-        elif (cached := _dp_size_cache.get(provider_key)) is not None:
+        if (cached := _dp_size_cache.get(provider_key)) is not None:
             dp_size = int(cached["dp_size"])
+        elif provider_stats["per_dp"]:
+            dp_size = max(int(rank) for rank in provider_stats["per_dp"].keys()) + 1
 
         per_dp: list[dict] = []
         known_ranks = sorted(set(provider_stats["per_dp"].keys()) | set(sessions_per_rank.keys()))

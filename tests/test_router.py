@@ -19,7 +19,7 @@ import httpx
 
 from client import ProviderStream
 from converter import anthropic_to_openai, openai_to_anthropic, stream_openai_to_anthropic
-from config import apply_provider_params, load_config, resolve_route, get_provider
+from config import apply_provider_params, get_provider, load_config, resolve_route, validate_config
 from batch import (
     anthropic_batch_to_openai_jsonl,
     openai_batch_to_anthropic,
@@ -613,24 +613,45 @@ class TestProviderStreamRetry(unittest.IsolatedAsyncioTestCase):
 class TestConfig(unittest.TestCase):
 
     def test_resolve_route_default(self):
-        self.assertEqual(resolve_route({"Router": {"default": "p,m"}}), ("p", "m"))
+        self.assertEqual(resolve_route({"Router": {"default": "m"}}), "m")
 
     def test_resolve_route_scenario(self):
-        cfg = {"Router": {"default": "p,m1", "think": "p,m2"}}
-        self.assertEqual(resolve_route(cfg, "think"), ("p", "m2"))
+        cfg = {"Router": {"default": "m1", "think": "m2"}}
+        self.assertEqual(resolve_route(cfg, "think"), "m2")
 
     def test_resolve_route_fallback(self):
-        self.assertEqual(resolve_route({"Router": {"default": "p,m"}}, "missing"), ("p", "m"))
+        self.assertEqual(resolve_route({"Router": {"default": "m"}}, "missing"), "m")
 
     def test_resolve_route_no_router(self):
         self.assertIsNone(resolve_route({}))
 
+    def test_resolve_route_rejects_legacy_target(self):
+        self.assertIsNone(resolve_route({"Router": {"default": "p,m"}}))
+
     def test_get_provider_found(self):
-        p = get_provider({"Providers": [{"name": "foo", "api_key": "k"}]}, "foo")
+        p = get_provider({"Providers": [{"name": "foo", "model": "m", "api_key": "k"}]}, "foo")
         self.assertEqual(p["api_key"], "k")
 
     def test_get_provider_missing(self):
         self.assertIsNone(get_provider({"Providers": []}, "x"))
+
+    def test_validate_config_requires_provider_model(self):
+        with self.assertRaisesRegex(ValueError, "model is required"):
+            validate_config({
+                "Providers": [{"name": "foo", "api_base_url": "http://host/v1/chat/completions"}],
+                "Router": {"default": "/model"},
+            })
+
+    def test_validate_config_rejects_legacy_router_syntax(self):
+        with self.assertRaisesRegex(ValueError, "deprecated"):
+            validate_config({
+                "Providers": [{
+                    "name": "foo",
+                    "model": "/model",
+                    "api_base_url": "http://host/v1/chat/completions",
+                }],
+                "Router": {"default": "foo,/model"},
+            })
 
 
 class TestApplyProviderParams(unittest.TestCase):
@@ -704,6 +725,8 @@ class TestBuildConfig(unittest.TestCase):
 
         cfg = _build_config(args)
         self.assertEqual(cfg["Providers"][0]["tokenizer_path"], "/models/tokenizer")
+        self.assertEqual(cfg["Providers"][0]["model"], "/model")
+        self.assertEqual(cfg["Router"]["default"], "/model")
 
     def test_server_build_config_from_env_uses_tokenizer_path(self):
         import server as srv_mod
@@ -716,6 +739,7 @@ class TestBuildConfig(unittest.TestCase):
             cfg = srv_mod._build_config_from_env()
 
         self.assertEqual(cfg["Providers"][0]["tokenizer_path"], "/models/from-env")
+        self.assertEqual(cfg["Providers"][0]["model"], "/model")
 
     def test_main_build_config_includes_dp_sticky_mode(self):
         from main import _build_config
@@ -739,6 +763,7 @@ class TestBuildConfig(unittest.TestCase):
 
         cfg = _build_config(args)
         self.assertEqual(cfg["Providers"][0]["dp_routing"]["sticky_mode"], "session_system")
+        self.assertEqual(cfg["Providers"][0]["model"], "/model")
 
     def test_server_build_config_from_env_uses_dp_sticky_mode(self):
         import server as srv_mod
@@ -883,11 +908,12 @@ class TestTokenCountingEndpoint(unittest.IsolatedAsyncioTestCase):
             "API_TIMEOUT_MS": 60000,
             "Providers": [{
                 "name": "sglang",
+                "model": "/model",
                 "api_base_url": "http://host:30000/v1/chat/completions",
                 "api_key": "k",
                 "tokenizer_path": "/models/tokenizer",
             }],
-            "Router": {"default": "sglang,/model"},
+            "Router": {"default": "/model"},
         })
 
         from httpx import ASGITransport, AsyncClient
@@ -905,7 +931,7 @@ class TestTokenCountingEndpoint(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.srv, "_count_tokens_via_sglang", new=AsyncMock(return_value=17)) as backend_mock, \
              patch.object(self.srv, "_count_tokens_in_openai_req") as local_mock:
             resp = await self.client.post("/v1/messages/count_tokens", json={
-                "model": "ignored",
+                "model": "default",
                 "messages": [{"role": "user", "content": "hello"}],
             })
 
@@ -918,7 +944,7 @@ class TestTokenCountingEndpoint(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.srv, "_count_tokens_via_sglang", new=AsyncMock(return_value=None)) as backend_mock, \
              patch.object(self.srv, "_count_tokens_in_openai_req", return_value=23) as local_mock:
             resp = await self.client.post("/v1/messages/count_tokens", json={
-                "model": "ignored",
+                "model": "default",
                 "messages": [{"role": "user", "content": "hello"}],
             })
 
@@ -926,6 +952,39 @@ class TestTokenCountingEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.json(), {"input_tokens": 23})
         backend_mock.assert_awaited_once()
         local_mock.assert_called_once()
+
+    async def test_count_tokens_uses_exact_model_when_requested(self):
+        self.srv.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [
+                {
+                    "name": "default-provider",
+                    "model": "/model",
+                    "api_base_url": "http://host:30000/v1/chat/completions",
+                    "api_key": "k",
+                    "tokenizer_path": "/models/default-tokenizer",
+                },
+                {
+                    "name": "other-provider",
+                    "model": "other-model",
+                    "api_base_url": "http://other:30000/v1/chat/completions",
+                    "api_key": "k2",
+                    "tokenizer_path": "/models/other-tokenizer",
+                },
+            ],
+            "Router": {"default": "/model"},
+        })
+
+        with patch.object(self.srv, "_count_tokens_via_sglang", new=AsyncMock(return_value=None)), \
+             patch.object(self.srv, "_count_tokens_in_openai_req", return_value=23) as local_mock:
+            resp = await self.client.post("/v1/messages/count_tokens", json={
+                "model": "other-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            })
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json(), {"input_tokens": 23})
+        self.assertEqual(local_mock.call_args.args[1], "/models/other-tokenizer")
 
 
 # ============================================================================
@@ -1143,11 +1202,12 @@ class TestDPRoutingHelpers(unittest.IsolatedAsyncioTestCase):
             "API_TIMEOUT_MS": 60000,
             "Providers": [{
                 "name": "sglang",
+                "model": "/model",
                 "api_base_url": "http://host:8000/v1/chat/completions",
                 "api_key": "k",
                 "dp_routing": {"enabled": True, "server_info_ttl_sec": 30},
             }],
-            "Router": {"default": "sglang,/model"},
+            "Router": {"default": "/model"},
         })
         provider = srv_mod.get_provider(srv_mod._config, "sglang")
         fake_client = FakeClient()
@@ -1179,12 +1239,13 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
             "API_TIMEOUT_MS": 60000,
             "Providers": [{
                 "name": "sglang",
+                "model": "/model",
                 "api_base_url": "http://host:8000/v1/chat/completions",
                 "api_key": "k",
                 "max_retries": 1,
                 "dp_routing": {"enabled": True, "server_info_ttl_sec": 30},
             }],
-            "Router": {"default": "sglang,/model"},
+            "Router": {"default": "/model"},
         })
 
         from httpx import ASGITransport, AsyncClient
@@ -1200,7 +1261,7 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
 
     def _messages_req(self, extra=None):
         req = {
-            "model": "ignored",
+            "model": "default",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "Reply with exactly: PONG"}],
         }
@@ -1243,6 +1304,86 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.headers["X-Router-DP-Rank"], str(expected_rank))
         self.assertEqual(resp.headers["X-Router-Sticky-Key"], session_id)
 
+    async def test_exact_model_request_uses_matching_provider_pool(self):
+        sent_bodies = []
+        self.srv.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [
+                {
+                    "name": "default-provider",
+                    "model": "/model",
+                    "api_base_url": "http://default:8000/v1/chat/completions",
+                    "api_key": "k1",
+                    "max_retries": 1,
+                },
+                {
+                    "name": "other-provider",
+                    "model": "other-model",
+                    "api_base_url": "http://other:8000/v1/chat/completions",
+                    "api_key": "k2",
+                    "max_retries": 1,
+                },
+            ],
+            "Router": {"default": "/model"},
+        })
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_bodies.append((url, dict(body)))
+            return self._openai_resp()
+
+        with patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req({"model": "other-model"}),
+                headers={self.srv._CLAUDE_SESSION_HEADER: "session-sticky"},
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(sent_bodies[0][0], "http://other:8000/v1/chat/completions")
+        self.assertEqual(sent_bodies[0][1]["model"], "other-model")
+
+    async def test_model_alias_uses_router_mapping(self):
+        sent_bodies = []
+        self.srv.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [{
+                "name": "alias-provider",
+                "model": "backend-model",
+                "api_base_url": "http://alias:8000/v1/chat/completions",
+                "api_key": "k1",
+                "max_retries": 1,
+            }],
+            "Router": {
+                "default": "backend-model",
+                "fast": "backend-model",
+            },
+        })
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_bodies.append((url, dict(body)))
+            return self._openai_resp()
+
+        with patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req({"model": "fast"}),
+                headers={self.srv._CLAUDE_SESSION_HEADER: "session-sticky"},
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(sent_bodies[0][0], "http://alias:8000/v1/chat/completions")
+        self.assertEqual(sent_bodies[0][1]["model"], "backend-model")
+
+    async def test_unknown_exact_model_returns_400_with_available_models(self):
+        resp = await self.client.post(
+            "/v1/messages",
+            json=self._messages_req({"model": "missing-model"}),
+        )
+
+        self.assertEqual(resp.status_code, 400, resp.text)
+        self.assertIn("missing-model", resp.text)
+        self.assertIn("/model", resp.text)
+
     async def test_messages_without_sticky_headers_gets_generated_session(self):
         """When no session header is provided, a UUID is generated and DP routing still happens."""
         sent_bodies = []
@@ -1262,17 +1403,18 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         # A sticky key should be generated
         self.assertIn("X-Router-Sticky-Key", resp.headers)
 
-    async def test_dp_routing_disabled_leaves_request_unmodified(self):
+    async def test_single_provider_without_dp_uses_synthetic_rank_zero(self):
         sent_bodies = []
         self.srv.set_config({
             "API_TIMEOUT_MS": 60000,
             "Providers": [{
                 "name": "sglang",
+                "model": "/model",
                 "api_base_url": "http://host:8000/v1/chat/completions",
                 "api_key": "k",
                 "max_retries": 1,
             }],
-            "Router": {"default": "sglang,/model"},
+            "Router": {"default": "/model"},
         })
 
         async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
@@ -1289,8 +1431,8 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertNotIn("routed_dp_rank", sent_bodies[0])
-        self.assertNotIn("X-Router-DP-Rank", resp.headers)
+        self.assertEqual(sent_bodies[0]["routed_dp_rank"], 0)
+        self.assertEqual(resp.headers["X-Router-DP-Rank"], "0")
         fake_dp_size.assert_not_awaited()
 
     async def test_override_header_wins_over_session_hash(self):
@@ -1344,7 +1486,7 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status_code, 400)
         fake_post.assert_not_awaited()
 
-    async def test_dp_size_one_skips_rank_injection(self):
+    async def test_dp_size_one_maps_to_rank_zero(self):
         sent_bodies = []
 
         async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
@@ -1363,8 +1505,8 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertNotIn("routed_dp_rank", sent_bodies[0])
-        self.assertNotIn("X-Router-DP-Rank", resp.headers)
+        self.assertEqual(sent_bodies[0]["routed_dp_rank"], 0)
+        self.assertEqual(resp.headers["X-Router-DP-Rank"], "0")
 
     async def test_streaming_messages_inject_rank_and_headers(self):
         sent_bodies = []
@@ -1423,6 +1565,7 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
             "API_TIMEOUT_MS": 60000,
             "Providers": [{
                 "name": "sglang",
+                "model": "/model",
                 "api_base_url": "http://host:8000/v1/chat/completions",
                 "api_key": "k",
                 "max_retries": 1,
@@ -1432,7 +1575,7 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
                     "sticky_mode": "session_system",
                 },
             }],
-            "Router": {"default": "sglang,/model"},
+            "Router": {"default": "/model"},
         })
 
         async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
@@ -1503,17 +1646,24 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         """Test that when dp_size shrinks and stored rank becomes invalid, retry works."""
         sent_bodies = []
         session_id = "test-session-retry"
-
-        # Pre-populate allocator to have session at rank 3 (which will be invalid for dp_size=2)
-        allocator = self.srv._get_or_create_allocator(
-            {"name": "sglang", "api_base_url": "http://host:8000/v1/chat/completions"},
-            4
-        )
-        # Assign ranks 0,1,2 to other sessions first
+        provider = self.srv._config["Providers"][0]
+        slots = [
+            self.srv.RoutingSlot(
+                flat_index=rank,
+                slot_id=self.srv._provider_slot_id(provider, rank),
+                provider=provider,
+                provider_key=self.srv._dp_cache_key(provider),
+                provider_name=provider["name"],
+                model="/model",
+                provider_dp_rank=rank,
+                dp_size=4,
+            )
+            for rank in range(4)
+        ]
+        allocator = self.srv._get_or_create_model_allocator("/model", slots)
         allocator.assign("session-0")
         allocator.assign("session-1")
         allocator.assign("session-2")
-        # Now assign rank 3 to our test session
         allocator.assign(session_id)
 
         async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
@@ -1576,7 +1726,7 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
             resp = await self.client.post(
                 "/v1/complete",
                 json={
-                    "model": "ignored",
+                    "model": "default",
                     "prompt": "\n\nHuman: Reply with exactly: PONG\n\nAssistant:",
                     "max_tokens_to_sample": 32,
                 },
@@ -1601,12 +1751,13 @@ class TestMetricsEndpoint(unittest.IsolatedAsyncioTestCase):
             "API_TIMEOUT_MS": 60000,
             "Providers": [{
                 "name": "sglang",
+                "model": "/model",
                 "api_base_url": "http://host:8000/v1/chat/completions",
                 "api_key": "k",
                 "max_retries": 1,
                 "dp_routing": {"enabled": True, "server_info_ttl_sec": 30},
             }],
-            "Router": {"default": "sglang,/model"},
+            "Router": {"default": "/model"},
         })
 
         from httpx import ASGITransport, AsyncClient
@@ -1622,7 +1773,7 @@ class TestMetricsEndpoint(unittest.IsolatedAsyncioTestCase):
 
     def _messages_req(self, extra=None):
         req = {
-            "model": "ignored",
+            "model": "default",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "Reply with exactly: PONG"}],
         }
@@ -1761,11 +1912,12 @@ class IntegrationBase(unittest.IsolatedAsyncioTestCase):
             "API_TIMEOUT_MS": 60000,
             "Providers": [{
                 "name": "test",
+                "model": PROVIDER_MODEL,
                 "api_base_url": PROVIDER_URL,
                 "api_key": PROVIDER_KEY,
                 "max_retries": 1,
             }],
-            "Router": {"default": f"test,{PROVIDER_MODEL}"},
+            "Router": {"default": PROVIDER_MODEL},
         })
         from httpx import ASGITransport, AsyncClient
         self.client = AsyncClient(
@@ -1778,7 +1930,7 @@ class IntegrationBase(unittest.IsolatedAsyncioTestCase):
         await self.client.aclose()
 
     def _req(self, extra=None):
-        r = {"model": "ignored", "max_tokens": 128,
+        r = {"model": "default", "max_tokens": 128,
              "messages": [{"role": "user", "content": "Reply with exactly: PONG"}]}
         if extra:
             r.update(extra)
@@ -1832,7 +1984,7 @@ class TestIntegrationMessages(IntegrationBase):
     @_requires_provider
     async def test_multi_turn(self):
         data = (await self.client.post("/v1/messages", json={
-            "model": "ignored", "max_tokens": 128,
+            "model": "default", "max_tokens": 128,
             "messages": [
                 {"role": "user", "content": "Say: FIRST"},
                 {"role": "assistant", "content": "FIRST"},
@@ -1843,7 +1995,7 @@ class TestIntegrationMessages(IntegrationBase):
 
     @_requires_provider
     async def test_tool_use(self):
-        req = {"model": "ignored", "max_tokens": 256,
+        req = {"model": "default", "max_tokens": 256,
                "tools": [{"name": "get_number", "description": "Returns a number",
                            "input_schema": {"type": "object",
                                             "properties": {"n": {"type": "integer"}},
@@ -1858,7 +2010,7 @@ class TestIntegrationMessages(IntegrationBase):
 
     @_requires_provider
     async def test_tool_choice_none(self):
-        req = {"model": "ignored", "max_tokens": 128,
+        req = {"model": "default", "max_tokens": 128,
                "tools": [{"name": "fn", "description": "A tool",
                            "input_schema": {"type": "object"}}],
                "tool_choice": {"type": "none"},
@@ -1874,7 +2026,7 @@ class TestIntegrationMessages(IntegrationBase):
 
     @_requires_provider
     async def test_stop_sequences(self):
-        req = {"model": "ignored", "max_tokens": 64,
+        req = {"model": "default", "max_tokens": 64,
                "stop_sequences": ["STOP"],
                "messages": [{"role": "user", "content": "Count: 1 2 3 STOP 4 5"}]}
         resp = await self.client.post("/v1/messages", json=req)
@@ -1931,7 +2083,7 @@ class TestIntegrationStreaming(IntegrationBase):
 
     @_requires_provider
     async def test_stream_tool_use(self):
-        req = {"model": "ignored", "max_tokens": 256,
+        req = {"model": "default", "max_tokens": 256,
                "tools": [{"name": "get_number", "description": "Returns a number",
                            "input_schema": {"type": "object",
                                             "properties": {"n": {"type": "integer"}},
@@ -1951,7 +2103,7 @@ class TestIntegrationStreaming(IntegrationBase):
 
     @_requires_provider
     async def test_stream_multi_turn(self):
-        req = {"model": "ignored", "max_tokens": 128, "messages": [
+        req = {"model": "default", "max_tokens": 128, "messages": [
             {"role": "user", "content": "Say: FIRST"},
             {"role": "assistant", "content": "FIRST"},
             {"role": "user", "content": "Now say: SECOND"},
@@ -1998,7 +2150,7 @@ class TestIntegrationLegacyCompletions(IntegrationBase):
     @_requires_provider
     async def test_legacy_complete(self):
         resp = await self.client.post("/v1/complete", json={
-            "model": "ignored",
+            "model": "default",
             "prompt": "\n\nHuman: Reply with exactly: PONG\n\nAssistant:",
             "max_tokens_to_sample": 64,
         })
@@ -2012,7 +2164,7 @@ class TestIntegrationLegacyCompletions(IntegrationBase):
     @_requires_provider
     async def test_legacy_response_schema(self):
         resp = await self.client.post("/v1/complete", json={
-            "model": "ignored",
+            "model": "default",
             "prompt": "\n\nHuman: Hi\n\nAssistant:",
             "max_tokens_to_sample": 32,
             "temperature": 0.0,

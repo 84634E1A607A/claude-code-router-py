@@ -3,6 +3,8 @@ import os
 import re
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+
 
 def _interpolate_env_vars(obj: Any) -> Any:
     """Recursively replace $VAR or ${VAR} with environment variable values."""
@@ -21,7 +23,7 @@ def _interpolate_env_vars(obj: Any) -> Any:
 def load_config(path: str) -> dict:
     with open(path, encoding="utf-8") as f:
         raw = json.load(f)
-    return _interpolate_env_vars(raw)
+    return validate_config(_interpolate_env_vars(raw))
 
 
 def get_provider(config: dict, name: str) -> dict | None:
@@ -29,6 +31,73 @@ def get_provider(config: dict, name: str) -> dict | None:
         if p["name"] == name:
             return p
     return None
+
+
+def get_providers_for_model(config: dict, model: str) -> list[dict]:
+    return [
+        provider
+        for provider in config.get("Providers", [])
+        if isinstance(provider, dict) and provider.get("model") == model
+    ]
+
+
+class ProviderConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    model: str
+    api_base_url: str
+
+    @field_validator("name", "model", "api_base_url")
+    @classmethod
+    def _non_empty(cls, value: str, info) -> str:
+        value = value.strip()
+        if not value:
+            field_name = info.field_name
+            if field_name == "model":
+                raise ValueError("model is required and must be non-empty")
+            raise ValueError(f"{field_name} is required")
+        return value
+
+
+class RouterConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    default: str
+
+    @field_validator("*")
+    @classmethod
+    def _valid_target(cls, value: str, info) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{info.field_name} must be a non-empty model name")
+        value = value.strip()
+        if "," in value:
+            raise ValueError(
+                f"{info.field_name} uses deprecated 'provider,model' syntax; use only the model name"
+            )
+        return value
+
+
+class ConfigModel(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    Providers: list[ProviderConfig] = Field(min_length=1)
+    Router: RouterConfig
+
+    @model_validator(mode="after")
+    def _validate_cross_refs(self):
+        provider_names: set[str] = set()
+        provider_models: set[str] = set()
+        for provider in self.Providers:
+            if provider.name in provider_names:
+                raise ValueError(f"Duplicate provider name '{provider.name}'")
+            provider_names.add(provider.name)
+            provider_models.add(provider.model)
+
+        for scenario, target in self.Router.model_dump().items():
+            if target not in provider_models:
+                raise ValueError(f"Router.{scenario} model '{target}' has no matching provider")
+        return self
 
 
 def apply_provider_params(provider: dict, req: dict) -> dict:
@@ -63,13 +132,30 @@ def apply_provider_params(provider: dict, req: dict) -> dict:
     return req
 
 
-def resolve_route(config: dict, scenario: str = "default") -> tuple[str, str] | None:
-    """Return (provider_name, model) for the given routing scenario."""
+def resolve_route(config: dict, scenario: str = "default") -> str | None:
+    """Return the routed model name for the given routing scenario."""
     router = config.get("Router", {})
     target = router.get(scenario) or router.get("default")
     if not target:
         return None
-    parts = target.split(",", 1)
-    if len(parts) != 2:
+    if not isinstance(target, str):
         return None
-    return parts[0].strip(), parts[1].strip()
+    model = target.strip()
+    if not model or "," in model:
+        return None
+    return model
+
+
+def validate_config(config: dict) -> dict:
+    if not config:
+        return config
+    try:
+        parsed = ConfigModel.model_validate(config)
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        path = ".".join(str(part) for part in first.get("loc", ()))
+        msg = first.get("msg", "invalid config")
+        if first.get("type") == "missing" and path.endswith(".model"):
+            msg = "model is required and must be non-empty"
+        raise ValueError(f"{path}: {msg}" if path else msg) from exc
+    return parsed.model_dump(mode="python")
