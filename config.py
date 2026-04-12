@@ -26,6 +26,85 @@ def load_config(path: str) -> dict:
     return validate_config(_interpolate_env_vars(raw))
 
 
+def resolve_tokenizer_path(*candidates: str | None) -> str | None:
+    """Return the first non-empty tokenizer path from explicit values or env."""
+    for value in candidates:
+        if isinstance(value, str):
+            value = value.strip()
+            if value:
+                return value
+    return None
+
+
+def build_inline_config(
+    *,
+    api_base_url: str,
+    api_key: str = "",
+    model: str = "/model",
+    max_retries: int = 3,
+    port: int | None = None,
+    api_timeout_ms: int = 120_000,
+    tokenizer_path: str | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_tokens: int | None = None,
+    budget_tokens: int | None = None,
+    dp_routing_enabled: bool = False,
+    dp_server_info_ttl_sec: int = 30,
+    dp_sticky_mode: str | None = None,
+    dp_session_ttl_sec: float | None = None,
+) -> dict:
+    """Build a minimal validated config from inline flags or environment values."""
+    params: dict[str, Any] = {}
+    if temperature is not None:
+        params["temperature"] = temperature
+    if top_p is not None:
+        params["top_p"] = top_p
+    if max_tokens is not None:
+        params["max_tokens"] = max_tokens
+    if budget_tokens is not None:
+        params["reasoning"] = {"budget_tokens": budget_tokens}
+
+    resolved_tokenizer_path = resolve_tokenizer_path(
+        tokenizer_path,
+        os.environ.get("CCR_TOKENIZER_PATH"),
+        os.environ.get("TOKENIZER_PATH"),
+    )
+
+    provider: dict[str, Any] = {
+        "name": "default",
+        "model": model,
+        "api_base_url": api_base_url,
+        "api_key": api_key or os.environ.get("API_KEY", ""),
+        "max_retries": max_retries,
+    }
+    if params:
+        provider["params"] = params
+    if resolved_tokenizer_path:
+        provider["tokenizer_path"] = resolved_tokenizer_path
+    if dp_routing_enabled:
+        dp_routing: dict[str, Any] = {
+            "enabled": True,
+            "server_info_ttl_sec": dp_server_info_ttl_sec,
+        }
+        if dp_sticky_mode:
+            dp_routing["sticky_mode"] = dp_sticky_mode
+        if dp_session_ttl_sec is not None:
+            dp_routing["session_ttl_sec"] = dp_session_ttl_sec
+        provider["dp_routing"] = dp_routing
+
+    cfg: dict[str, Any] = {
+        "API_TIMEOUT_MS": api_timeout_ms,
+        "Providers": [provider],
+        "Router": {"default": model},
+    }
+    if port is not None:
+        cfg["PORT"] = port
+    if resolved_tokenizer_path:
+        cfg["tokenizer_path"] = resolved_tokenizer_path
+    return cfg
+
+
 def get_provider(config: dict, name: str) -> dict | None:
     for p in config.get("Providers", []):
         if p["name"] == name:

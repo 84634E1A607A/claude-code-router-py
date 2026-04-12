@@ -24,7 +24,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from batch import anthropic_batch_to_openai_jsonl, openai_batch_to_anthropic, openai_results_line_to_anthropic
 from client import ProviderError, ProviderStream, close_shared_client, get_shared_client, open_provider_stream, post_json
-from config import apply_provider_params, get_provider, load_config, resolve_route, validate_config
+from config import (
+    apply_provider_params,
+    build_inline_config,
+    get_provider,
+    load_config,
+    resolve_route,
+    validate_config,
+)
 from converter import anthropic_to_openai, openai_to_anthropic, stream_openai_to_anthropic
 from debug import check_and_save_nonstreaming, check_and_save_streaming, log_openai_request
 
@@ -594,51 +601,22 @@ def _build_config_from_env() -> dict | None:
     api_base_url = os.environ.get("CCR_API_BASE_URL")
     if not api_base_url:
         return None
-
-    params: dict = {}
-    if (v := os.environ.get("CCR_TEMPERATURE")) is not None:
-        params["temperature"] = float(v)
-    if (v := os.environ.get("CCR_TOP_P")) is not None:
-        params["top_p"] = float(v)
-    if (v := os.environ.get("CCR_MAX_TOKENS")) is not None:
-        params["max_tokens"] = int(v)
-    if (v := os.environ.get("CCR_BUDGET_TOKENS")) is not None:
-        params["reasoning"] = {"budget_tokens": int(v)}
-
-    provider: dict = {
-        "name": "default",
-        "model": os.environ.get("CCR_MODEL", "/model"),
-        "api_base_url": api_base_url,
-        "api_key": os.environ.get("CCR_API_KEY") or os.environ.get("API_KEY", ""),
-        "max_retries": int(os.environ.get("CCR_MAX_RETRIES", "3")),
-    }
-    if (tokenizer_path := os.environ.get("CCR_TOKENIZER_PATH") or os.environ.get("TOKENIZER_PATH")):
-        provider["tokenizer_path"] = tokenizer_path
-    if os.environ.get("CCR_DP_ROUTING_ENABLED", "").strip().lower() in ("1", "true", "yes"):
-        dp_routing_cfg: dict = {
-            "enabled": True,
-            "server_info_ttl_sec": int(os.environ.get("CCR_DP_SERVER_INFO_TTL_SEC", str(_DP_SERVER_INFO_TTL_SEC))),
-        }
-        if (v := os.environ.get("CCR_DP_STICKY_MODE")) is not None:
-            dp_routing_cfg["sticky_mode"] = v
-        if (v := os.environ.get("CCR_DP_SESSION_TTL_SEC")) is not None:
-            dp_routing_cfg["session_ttl_sec"] = float(v)
-        provider["dp_routing"] = dp_routing_cfg
-    if params:
-        provider["params"] = params
-
-    tokenizer_path = os.environ.get("CCR_TOKENIZER_PATH") or os.environ.get("TOKENIZER_PATH")
-    if tokenizer_path:
-        provider["tokenizer_path"] = tokenizer_path
-
-    cfg: dict = {
-        "API_TIMEOUT_MS": int(os.environ.get("CCR_API_TIMEOUT_MS", "850000")),
-        "Providers": [provider],
-        "Router": {"default": provider["model"]},
-    }
-    if tokenizer_path:
-        cfg["tokenizer_path"] = tokenizer_path
-    return cfg
+    return build_inline_config(
+        api_base_url=api_base_url,
+        api_key=os.environ.get("CCR_API_KEY", ""),
+        model=os.environ.get("CCR_MODEL", "/model"),
+        max_retries=int(os.environ.get("CCR_MAX_RETRIES", "3")),
+        api_timeout_ms=int(os.environ.get("CCR_API_TIMEOUT_MS", "850000")),
+        tokenizer_path=os.environ.get("CCR_TOKENIZER_PATH"),
+        temperature=float(v) if (v := os.environ.get("CCR_TEMPERATURE")) is not None else None,
+        top_p=float(v) if (v := os.environ.get("CCR_TOP_P")) is not None else None,
+        max_tokens=int(v) if (v := os.environ.get("CCR_MAX_TOKENS")) is not None else None,
+        budget_tokens=int(v) if (v := os.environ.get("CCR_BUDGET_TOKENS")) is not None else None,
+        dp_routing_enabled=os.environ.get("CCR_DP_ROUTING_ENABLED", "").strip().lower() in ("1", "true", "yes"),
+        dp_server_info_ttl_sec=int(os.environ.get("CCR_DP_SERVER_INFO_TTL_SEC", str(_DP_SERVER_INFO_TTL_SEC))),
+        dp_sticky_mode=os.environ.get("CCR_DP_STICKY_MODE"),
+        dp_session_ttl_sec=float(v) if (v := os.environ.get("CCR_DP_SESSION_TTL_SEC")) is not None else None,
+    )
 
 
 @asynccontextmanager
@@ -648,17 +626,17 @@ async def lifespan(app: FastAPI):
         if inline := os.environ.get("CCR_CONFIG_JSON"):
             import json as _json
             try:
-                _config = validate_config(_json.loads(inline))
+                set_config(_json.loads(inline))
                 logger.info("Config loaded from CCR_CONFIG_JSON (worker pid=%d)", os.getpid())
             except Exception as exc:
                 logger.error("Failed to parse CCR_CONFIG_JSON: %s", exc)
         elif cfg := _build_config_from_env():
-            _config = validate_config(cfg)
+            set_config(cfg)
             logger.info("Config loaded from CCR_* env vars (worker pid=%d)", os.getpid())
         else:
             path = os.environ.get("CCR_CONFIG", "config.json")
             try:
-                _config = load_config(path)
+                set_config(load_config(path))
                 logger.info("Config loaded from %s (worker pid=%d)", path, os.getpid())
             except Exception as exc:
                 logger.error("Failed to load config %s: %s", path, exc)
@@ -1291,7 +1269,6 @@ async def messages(request: Request):
     selected_slot, openai_req, dp_decision = await _resolve_dp_routing(request, model, body, base_openai_req)
     provider = selected_slot.provider
     url = provider["api_base_url"]
-    base_openai_req = apply_provider_params(provider, base_openai_req)
     openai_req = apply_provider_params(provider, openai_req)
     _log_dp_routing(provider, dp_decision)
     log_openai_request(openai_req)

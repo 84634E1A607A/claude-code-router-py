@@ -2,9 +2,6 @@ import asyncio
 import json
 import logging
 import os
-import traceback
-import time
-import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
@@ -16,9 +13,6 @@ from transformers import AutoTokenizer
 import re
 from client import ProviderError, ProviderStream, open_provider_stream
 
-
-import re
-import json
 from typing import Iterable
 import uuid
 

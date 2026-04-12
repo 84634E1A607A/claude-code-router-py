@@ -8,53 +8,28 @@ import sys
 
 import uvicorn
 
-from config import load_config
+from config import build_inline_config, load_config
 from server import app, set_config
 
 
 def _build_config(args: argparse.Namespace) -> dict:
     """Construct a config dict from parsed CLI arguments."""
-    params: dict = {}
-    if args.temperature is not None:
-        params["temperature"] = args.temperature
-    if args.top_p is not None:
-        params["top_p"] = args.top_p
-    if args.max_tokens is not None:
-        params["max_tokens"] = args.max_tokens
-    if args.budget_tokens is not None:
-        params["reasoning"] = {"budget_tokens": args.budget_tokens}
-
-    provider: dict = {
-        "name": "default",
-        "model": args.model,
-        "api_base_url": args.api_base_url,
-        "api_key": args.api_key or os.environ.get("API_KEY", ""),
-        "max_retries": args.max_retries,
-    }
-    if args.tokenizer_path:
-        provider["tokenizer_path"] = args.tokenizer_path
-    if args.dp_routing:
-        provider["dp_routing"] = {
-            "enabled": True,
-            "server_info_ttl_sec": args.dp_server_info_ttl_sec,
-            "sticky_mode": args.dp_sticky_mode,
-        }
-    if params:
-        provider["params"] = params
-
-    tokenizer_path = args.tokenizer_path or os.environ.get("CCR_TOKENIZER_PATH") or os.environ.get("TOKENIZER_PATH")
-    if tokenizer_path:
-        provider["tokenizer_path"] = tokenizer_path
-
-    cfg: dict = {
-        "PORT": args.port,
-        "API_TIMEOUT_MS": args.api_timeout_ms,
-        "Providers": [provider],
-        "Router": {"default": args.model},
-    }
-    if tokenizer_path:
-        cfg["tokenizer_path"] = tokenizer_path
-    return cfg
+    return build_inline_config(
+        api_base_url=args.api_base_url,
+        api_key=args.api_key,
+        model=args.model,
+        max_retries=args.max_retries,
+        port=args.port,
+        api_timeout_ms=args.api_timeout_ms,
+        tokenizer_path=args.tokenizer_path,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.max_tokens,
+        budget_tokens=args.budget_tokens,
+        dp_routing_enabled=args.dp_routing,
+        dp_server_info_ttl_sec=args.dp_server_info_ttl_sec,
+        dp_sticky_mode=args.dp_sticky_mode,
+    )
 
 
 def main() -> None:
@@ -71,8 +46,6 @@ def main() -> None:
                         help="Provider API key (falls back to $API_KEY)")
     parser.add_argument("--model", default="/model", metavar="MODEL",
                         help="Model name/path forwarded to the provider")
-    parser.add_argument("--tokenizer-path", default=os.environ.get("TOKENIZER_PATH"), metavar="PATH",
-                        help="Tokenizer path/repo for /v1/messages/count_tokens")
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--dp-routing", action="store_true",
                         help="Enable SGLang DP-rank pinning for /v1/messages")

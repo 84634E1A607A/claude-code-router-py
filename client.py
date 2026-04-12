@@ -194,18 +194,3 @@ async def open_provider_stream(
 
     raise last_exc or ProviderError(0, "Unknown error after retries")
 
-
-async def stream_lines(
-    url: str,
-    headers: dict,
-    body: dict,
-    timeout: float = 600.0,
-    max_retries: int = 3,
-) -> AsyncIterator[bytes]:
-    """POST and yield raw SSE lines. Retries on transient errors."""
-    stream = await open_provider_stream(url, headers, body, timeout, max_retries)
-    try:
-        async for line in stream:
-            yield line
-    finally:
-        await stream.aclose()

@@ -19,7 +19,14 @@ import httpx
 
 from client import ProviderStream
 from converter import anthropic_to_openai, openai_to_anthropic, stream_openai_to_anthropic
-from config import apply_provider_params, get_provider, load_config, resolve_route, validate_config
+from config import (
+    apply_provider_params,
+    build_inline_config,
+    get_provider,
+    load_config,
+    resolve_route,
+    validate_config,
+)
 from batch import (
     anthropic_batch_to_openai_jsonl,
     openai_batch_to_anthropic,
@@ -275,7 +282,10 @@ class TestAnthropicToOpenAI(unittest.TestCase):
                                    "output_config": {"format": {"type": "json_schema",
                                                                  "schema": schema}}})
         self.assertEqual(out["response_format"]["type"], "json_schema")
-        self.assertEqual(out["response_format"]["json_schema"], schema)
+        self.assertEqual(
+            out["response_format"]["json_schema"],
+            {"name": "response", "schema": schema},
+        )
 
     def test_output_config_absent(self):
         out = anthropic_to_openai({"model": "m", "messages": []})
@@ -702,6 +712,15 @@ class TestApplyProviderParams(unittest.TestCase):
 
 
 class TestBuildConfig(unittest.TestCase):
+    def test_build_inline_config_uses_env_tokenizer_fallback(self):
+        with patch.dict(os.environ, {"CCR_TOKENIZER_PATH": "/models/from-env"}, clear=True):
+            cfg = build_inline_config(
+                api_base_url="http://host/v1/chat/completions",
+                model="/model",
+            )
+
+        self.assertEqual(cfg["Providers"][0]["tokenizer_path"], "/models/from-env")
+        self.assertEqual(cfg["tokenizer_path"], "/models/from-env")
 
     def test_main_build_config_includes_tokenizer_path(self):
         from main import _build_config
@@ -777,6 +796,28 @@ class TestBuildConfig(unittest.TestCase):
             cfg = srv_mod._build_config_from_env()
 
         self.assertEqual(cfg["Providers"][0]["dp_routing"]["sticky_mode"], "session_system")
+
+
+class TestLifespanConfigLoading(unittest.IsolatedAsyncioTestCase):
+    async def test_lifespan_populates_model_index_from_inline_config(self):
+        import server as srv_mod
+
+        srv_mod.set_config({})
+        inline = {
+            "Providers": [
+                {
+                    "name": "default",
+                    "model": "/model",
+                    "api_base_url": "http://host/v1/chat/completions",
+                }
+            ],
+            "Router": {"default": "/model"},
+        }
+
+        with patch.dict(os.environ, {"CCR_CONFIG_JSON": json.dumps(inline)}, clear=True):
+            async with srv_mod.lifespan(srv_mod.app):
+                self.assertIn("/model", srv_mod._providers_by_model)
+                self.assertEqual(srv_mod._available_models, ("/model",))
 
 
 class TestTokenCounting(unittest.TestCase):
