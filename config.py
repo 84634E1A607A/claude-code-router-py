@@ -3,7 +3,7 @@ import os
 import re
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, RootModel, ValidationError, field_validator, model_validator
 
 
 def _interpolate_env_vars(obj: Any) -> Any:
@@ -26,85 +26,6 @@ def load_config(path: str) -> dict:
     return validate_config(_interpolate_env_vars(raw))
 
 
-def resolve_tokenizer_path(*candidates: str | None) -> str | None:
-    """Return the first non-empty tokenizer path from explicit values or env."""
-    for value in candidates:
-        if isinstance(value, str):
-            value = value.strip()
-            if value:
-                return value
-    return None
-
-
-def build_inline_config(
-    *,
-    api_base_url: str,
-    api_key: str = "",
-    model: str = "/model",
-    max_retries: int = 3,
-    port: int | None = None,
-    api_timeout_ms: int = 120_000,
-    tokenizer_path: str | None = None,
-    temperature: float | None = None,
-    top_p: float | None = None,
-    max_tokens: int | None = None,
-    budget_tokens: int | None = None,
-    dp_routing_enabled: bool = False,
-    dp_server_info_ttl_sec: int = 30,
-    dp_sticky_mode: str | None = None,
-    dp_session_ttl_sec: float | None = None,
-) -> dict:
-    """Build a minimal validated config from inline flags or environment values."""
-    params: dict[str, Any] = {}
-    if temperature is not None:
-        params["temperature"] = temperature
-    if top_p is not None:
-        params["top_p"] = top_p
-    if max_tokens is not None:
-        params["max_tokens"] = max_tokens
-    if budget_tokens is not None:
-        params["reasoning"] = {"budget_tokens": budget_tokens}
-
-    resolved_tokenizer_path = resolve_tokenizer_path(
-        tokenizer_path,
-        os.environ.get("CCR_TOKENIZER_PATH"),
-        os.environ.get("TOKENIZER_PATH"),
-    )
-
-    provider: dict[str, Any] = {
-        "name": "default",
-        "model": model,
-        "api_base_url": api_base_url,
-        "api_key": api_key or os.environ.get("API_KEY", ""),
-        "max_retries": max_retries,
-    }
-    if params:
-        provider["params"] = params
-    if resolved_tokenizer_path:
-        provider["tokenizer_path"] = resolved_tokenizer_path
-    if dp_routing_enabled:
-        dp_routing: dict[str, Any] = {
-            "enabled": True,
-            "server_info_ttl_sec": dp_server_info_ttl_sec,
-        }
-        if dp_sticky_mode:
-            dp_routing["sticky_mode"] = dp_sticky_mode
-        if dp_session_ttl_sec is not None:
-            dp_routing["session_ttl_sec"] = dp_session_ttl_sec
-        provider["dp_routing"] = dp_routing
-
-    cfg: dict[str, Any] = {
-        "API_TIMEOUT_MS": api_timeout_ms,
-        "Providers": [provider],
-        "Router": {"default": model},
-    }
-    if port is not None:
-        cfg["PORT"] = port
-    if resolved_tokenizer_path:
-        cfg["tokenizer_path"] = resolved_tokenizer_path
-    return cfg
-
-
 def get_provider(config: dict, name: str) -> dict | None:
     for p in config.get("Providers", []):
         if p["name"] == name:
@@ -120,12 +41,49 @@ def get_providers_for_model(config: dict, model: str) -> list[dict]:
     ]
 
 
+class ReasoningConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    budget_tokens: int = 8000
+
+
+class ProviderParamsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    temperature: float | None = None
+    top_p: float | None = None
+    max_tokens: int | None = None
+    reasoning: ReasoningConfig | None = None
+
+
+class DPRoutingConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    server_info_ttl_sec: int = 30
+    sticky_mode: str = "session_system"
+    session_ttl_sec: float = 10800.0
+
+    @field_validator("sticky_mode")
+    @classmethod
+    def _validate_sticky_mode(cls, value: str) -> str:
+        value = value.strip()
+        if value not in ("session", "system", "session_system"):
+            raise ValueError("sticky_mode must be one of: session, system, session_system")
+        return value
+
+
 class ProviderConfig(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     name: str
     model: str
     api_base_url: str
+    api_key: str = ""
+    max_retries: int = 3
+    tokenizer_path: str | None = None
+    params: ProviderParamsConfig | None = None
+    dp_routing: DPRoutingConfig | None = None
 
     @field_validator("name", "model", "api_base_url")
     @classmethod
@@ -139,29 +97,46 @@ class ProviderConfig(BaseModel):
         return value
 
 
-class RouterConfig(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    default: str
-
-    @field_validator("*")
+class RouterConfig(RootModel[dict[str, str]]):
+    @field_validator("root")
     @classmethod
-    def _valid_target(cls, value: str, info) -> str:
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"{info.field_name} must be a non-empty model name")
-        value = value.strip()
-        if "," in value:
-            raise ValueError(
-                f"{info.field_name} uses deprecated 'provider,model' syntax; use only the model name"
-            )
-        return value
+    def _valid_routes(cls, routes: dict[str, str]) -> dict[str, str]:
+        if "default" not in routes:
+            raise ValueError("default is required")
+        for field_name, value in routes.items():
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty model name")
+            value = value.strip()
+            if "," in value:
+                raise ValueError(
+                    f"{field_name} uses deprecated 'provider,model' syntax; use only the model name"
+                )
+            routes[field_name] = value
+        return routes
+
+    def get(self, key: str, default: str | None = None) -> str | None:
+        return self.root.get(key, default)
+
+    def items(self):
+        return self.root.items()
 
 
 class ConfigModel(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
+    PORT: int = 3456
+    API_TIMEOUT_MS: int = 600_000
+    tokenizer_path: str | None = None
     Providers: list[ProviderConfig] = Field(min_length=1)
     Router: RouterConfig
+
+    @field_validator("tokenizer_path")
+    @classmethod
+    def _normalize_optional_string(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
 
     @model_validator(mode="after")
     def _validate_cross_refs(self):
@@ -173,7 +148,7 @@ class ConfigModel(BaseModel):
             provider_names.add(provider.name)
             provider_models.add(provider.model)
 
-        for scenario, target in self.Router.model_dump().items():
+        for scenario, target in self.Router.items():
             if target not in provider_models:
                 raise ValueError(f"Router.{scenario} model '{target}' has no matching provider")
         return self

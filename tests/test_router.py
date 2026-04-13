@@ -8,7 +8,6 @@ Run:
 """
 
 import asyncio
-import argparse
 import json
 import os
 import sys
@@ -21,7 +20,6 @@ from client import ProviderStream
 from converter import anthropic_to_openai, openai_to_anthropic, stream_openai_to_anthropic
 from config import (
     apply_provider_params,
-    build_inline_config,
     get_provider,
     load_config,
     resolve_route,
@@ -663,6 +661,42 @@ class TestConfig(unittest.TestCase):
                 "Router": {"default": "foo,/model"},
             })
 
+    def test_validate_config_rejects_unknown_top_level_key(self):
+        with self.assertRaisesRegex(ValueError, "Extra inputs are not permitted"):
+            validate_config({
+                "Providers": [{
+                    "name": "foo",
+                    "model": "/model",
+                    "api_base_url": "http://host/v1/chat/completions",
+                }],
+                "Router": {"default": "/model"},
+                "unexpected": True,
+            })
+
+    def test_validate_config_rejects_unknown_provider_key(self):
+        with self.assertRaisesRegex(ValueError, "Extra inputs are not permitted"):
+            validate_config({
+                "Providers": [{
+                    "name": "foo",
+                    "model": "/model",
+                    "api_base_url": "http://host/v1/chat/completions",
+                    "unexpected": True,
+                }],
+                "Router": {"default": "/model"},
+            })
+
+    def test_validate_config_rejects_unknown_provider_param(self):
+        with self.assertRaisesRegex(ValueError, "Extra inputs are not permitted"):
+            validate_config({
+                "Providers": [{
+                    "name": "foo",
+                    "model": "/model",
+                    "api_base_url": "http://host/v1/chat/completions",
+                    "params": {"temperature": 0.7, "unexpected": 1},
+                }],
+                "Router": {"default": "/model"},
+            })
+
 
 class TestApplyProviderParams(unittest.TestCase):
 
@@ -709,93 +743,6 @@ class TestApplyProviderParams(unittest.TestCase):
         req = {"model": "m", "messages": [], "temperature": 0.5}
         out = apply_provider_params({"params": {}}, req)
         self.assertEqual(out["temperature"], 0.5)
-
-
-class TestBuildConfig(unittest.TestCase):
-    def test_build_inline_config_uses_env_tokenizer_fallback(self):
-        with patch.dict(os.environ, {"CCR_TOKENIZER_PATH": "/models/from-env"}, clear=True):
-            cfg = build_inline_config(
-                api_base_url="http://host/v1/chat/completions",
-                model="/model",
-            )
-
-        self.assertEqual(cfg["Providers"][0]["tokenizer_path"], "/models/from-env")
-        self.assertEqual(cfg["tokenizer_path"], "/models/from-env")
-
-    def test_main_build_config_includes_tokenizer_path(self):
-        from main import _build_config
-
-        args = argparse.Namespace(
-            api_base_url="http://host/v1/chat/completions",
-            api_key="k",
-            model="/model",
-            tokenizer_path="/models/tokenizer",
-            max_retries=2,
-            dp_routing=False,
-            dp_server_info_ttl_sec=30,
-            dp_sticky_mode="session",
-            temperature=None,
-            top_p=None,
-            max_tokens=None,
-            budget_tokens=None,
-            port=3456,
-            api_timeout_ms=120000,
-        )
-
-        cfg = _build_config(args)
-        self.assertEqual(cfg["Providers"][0]["tokenizer_path"], "/models/tokenizer")
-        self.assertEqual(cfg["Providers"][0]["model"], "/model")
-        self.assertEqual(cfg["Router"]["default"], "/model")
-
-    def test_server_build_config_from_env_uses_tokenizer_path(self):
-        import server as srv_mod
-
-        env = {
-            "CCR_API_BASE_URL": "http://host/v1/chat/completions",
-            "CCR_TOKENIZER_PATH": "/models/from-env",
-        }
-        with patch.dict(os.environ, env, clear=True):
-            cfg = srv_mod._build_config_from_env()
-
-        self.assertEqual(cfg["Providers"][0]["tokenizer_path"], "/models/from-env")
-        self.assertEqual(cfg["Providers"][0]["model"], "/model")
-
-    def test_main_build_config_includes_dp_sticky_mode(self):
-        from main import _build_config
-
-        args = argparse.Namespace(
-            api_base_url="http://host/v1/chat/completions",
-            api_key="k",
-            model="/model",
-            tokenizer_path=None,
-            max_retries=2,
-            dp_routing=True,
-            dp_server_info_ttl_sec=30,
-            dp_sticky_mode="session_system",
-            temperature=None,
-            top_p=None,
-            max_tokens=None,
-            budget_tokens=None,
-            port=3456,
-            api_timeout_ms=120000,
-        )
-
-        cfg = _build_config(args)
-        self.assertEqual(cfg["Providers"][0]["dp_routing"]["sticky_mode"], "session_system")
-        self.assertEqual(cfg["Providers"][0]["model"], "/model")
-
-    def test_server_build_config_from_env_uses_dp_sticky_mode(self):
-        import server as srv_mod
-
-        env = {
-            "CCR_API_BASE_URL": "http://host/v1/chat/completions",
-            "CCR_DP_ROUTING_ENABLED": "1",
-            "CCR_DP_STICKY_MODE": "session_system",
-        }
-        with patch.dict(os.environ, env, clear=True):
-            cfg = srv_mod._build_config_from_env()
-
-        self.assertEqual(cfg["Providers"][0]["dp_routing"]["sticky_mode"], "session_system")
 
 
 class TestLifespanConfigLoading(unittest.IsolatedAsyncioTestCase):
@@ -870,12 +817,12 @@ class TestDPRoutingStickyKeys(unittest.TestCase):
         import zlib
         return f"{zlib.adler32(block['text'].encode('utf-8')) & 0xffff:04x}"
 
-    def test_derive_dp_sticky_key_defaults_to_session(self):
+    def test_derive_dp_sticky_key_uses_system_hash_even_without_explicit_mode(self):
         import server as srv_mod
 
         sticky_key, source, subagent_id = srv_mod._derive_dp_sticky_key("session-1", {}, {"system": "Prompt"})
-        self.assertEqual(sticky_key, "session-1")
-        self.assertEqual(source, "session")
+        self.assertTrue(sticky_key.startswith("session-1:"))
+        self.assertEqual(source, "session_system")
         self.assertIsNone(subagent_id)
 
     def test_derive_dp_sticky_key_uses_system_hash(self):

@@ -26,7 +26,6 @@ from batch import anthropic_batch_to_openai_jsonl, openai_batch_to_anthropic, op
 from client import ProviderError, ProviderStream, close_shared_client, get_shared_client, open_provider_stream, post_json
 from config import (
     apply_provider_params,
-    build_inline_config,
     get_provider,
     load_config,
     resolve_route,
@@ -70,7 +69,7 @@ class DPRoutingDecision:
             headers["X-Router-Provider"] = self.provider_name
         if self.provider_dp_rank is not None:
             headers["X-Router-Provider-DP-Rank"] = str(self.provider_dp_rank)
-        if self.source in {"session", "session_system"} and self.sticky_key:
+        if self.source == "session_system" and self.sticky_key:
             headers["X-Router-Sticky-Key"] = self.sticky_key
         return headers
 
@@ -477,17 +476,6 @@ def _get_session_ttl(provider: dict) -> float:
         return 10800.0
 
 
-def _get_dp_sticky_mode(provider: dict) -> str:
-    """Get DP sticky-key mode from provider config, defaulting to session."""
-    cfg = provider.get("dp_routing")
-    if not isinstance(cfg, dict):
-        return "session"
-    mode = str(cfg.get("sticky_mode", "session")).strip().lower()
-    if mode in {"session", "session_system"}:
-        return mode
-    return "session"
-
-
 def _extract_anthropic_system_text(req: dict) -> str:
     """Extract text-only content from an Anthropic system prompt."""
     system = req.get("system")
@@ -542,15 +530,12 @@ def _extract_subagent_hash_input(req: dict) -> str | None:
     return text
 
 
-def _derive_sticky_key(session_id: str, sticky_mode: str, anthropic_req: dict) -> tuple[str, str, str | None]:
+def _derive_sticky_key(session_id: str, anthropic_req: dict) -> tuple[str, str, str | None]:
     """Build the sticky key used for sticky provider/DP routing.
 
-    `session_system` mode prefers a hash of `messages[0].content[1]` when that
+    Sticky routing always prefers a hash of `messages[0].content[1]` when that
     block is present and otherwise falls back to a normalized system-prompt hash.
     """
-    if sticky_mode != "session_system":
-        return session_id, "session", None
-
     subagent_hash_input = _extract_subagent_hash_input(anthropic_req)
     if subagent_hash_input:
         subagent_id = _short_sticky_hash(subagent_hash_input)
@@ -558,11 +543,11 @@ def _derive_sticky_key(session_id: str, sticky_mode: str, anthropic_req: dict) -
 
     system_text = _extract_anthropic_system_text(anthropic_req)
     if not system_text:
-        return session_id, "session", None
+        return session_id, "session_system", None
 
     normalized_system = _normalize_system_prompt(system_text)
     if not normalized_system:
-        return session_id, "session", None
+        return session_id, "session_system", None
 
     digest = _short_sticky_hash(normalized_system)
     return f"{session_id}:{digest}", "session_system", None
@@ -570,7 +555,7 @@ def _derive_sticky_key(session_id: str, sticky_mode: str, anthropic_req: dict) -
 
 def _derive_dp_sticky_key(session_id: str, provider: dict, anthropic_req: dict) -> tuple[str, str, str | None]:
     """Backward-compatible wrapper around the generic sticky-key helper."""
-    return _derive_sticky_key(session_id, _get_dp_sticky_mode(provider), anthropic_req)
+    return _derive_sticky_key(session_id, anthropic_req)
 
 
 def set_config(cfg: dict) -> None:
@@ -595,30 +580,6 @@ def set_config(cfg: dict) -> None:
     _runtime_metrics.reset()
 
 
-def _build_config_from_env() -> dict | None:
-    """Build config from individual CCR_* env vars (for gunicorn -e usage).
-    Returns None if CCR_API_BASE_URL is not set."""
-    api_base_url = os.environ.get("CCR_API_BASE_URL")
-    if not api_base_url:
-        return None
-    return build_inline_config(
-        api_base_url=api_base_url,
-        api_key=os.environ.get("CCR_API_KEY", ""),
-        model=os.environ.get("CCR_MODEL", "/model"),
-        max_retries=int(os.environ.get("CCR_MAX_RETRIES", "3")),
-        api_timeout_ms=int(os.environ.get("CCR_API_TIMEOUT_MS", "850000")),
-        tokenizer_path=os.environ.get("CCR_TOKENIZER_PATH"),
-        temperature=float(v) if (v := os.environ.get("CCR_TEMPERATURE")) is not None else None,
-        top_p=float(v) if (v := os.environ.get("CCR_TOP_P")) is not None else None,
-        max_tokens=int(v) if (v := os.environ.get("CCR_MAX_TOKENS")) is not None else None,
-        budget_tokens=int(v) if (v := os.environ.get("CCR_BUDGET_TOKENS")) is not None else None,
-        dp_routing_enabled=os.environ.get("CCR_DP_ROUTING_ENABLED", "").strip().lower() in ("1", "true", "yes"),
-        dp_server_info_ttl_sec=int(os.environ.get("CCR_DP_SERVER_INFO_TTL_SEC", str(_DP_SERVER_INFO_TTL_SEC))),
-        dp_sticky_mode=os.environ.get("CCR_DP_STICKY_MODE"),
-        dp_session_ttl_sec=float(v) if (v := os.environ.get("CCR_DP_SESSION_TTL_SEC")) is not None else None,
-    )
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _config
@@ -630,9 +591,6 @@ async def lifespan(app: FastAPI):
                 logger.info("Config loaded from CCR_CONFIG_JSON (worker pid=%d)", os.getpid())
             except Exception as exc:
                 logger.error("Failed to parse CCR_CONFIG_JSON: %s", exc)
-        elif cfg := _build_config_from_env():
-            set_config(cfg)
-            logger.info("Config loaded from CCR_* env vars (worker pid=%d)", os.getpid())
         else:
             path = os.environ.get("CCR_CONFIG", "config.json")
             try:
@@ -764,17 +722,6 @@ def _slot_ttl_for_providers(providers: list[dict]) -> float:
         if _get_session_ttl(provider) != ttl:
             raise HTTPException(500, "All DP-enabled providers for a model must share session_ttl_sec")
     return ttl
-
-
-def _slot_sticky_mode_for_providers(providers: list[dict]) -> str:
-    dp_enabled = [provider for provider in providers if _dp_routing_config(provider) is not None]
-    if not dp_enabled:
-        return "session"
-    mode = _get_dp_sticky_mode(dp_enabled[0])
-    for provider in dp_enabled[1:]:
-        if _get_dp_sticky_mode(provider) != mode:
-            raise HTTPException(500, "All DP-enabled providers for a model must share sticky_mode")
-    return mode
 
 
 async def _build_routing_slots(model: str, *, force_refresh: bool = False) -> list[RoutingSlot]:
@@ -1038,8 +985,7 @@ async def _resolve_dp_routing(
     if not session_id:
         session_id = str(uuid.uuid4())
 
-    sticky_mode = _slot_sticky_mode_for_providers([slot.provider for slot in slots])
-    sticky_key, sticky_source, subagent_id = _derive_sticky_key(session_id, sticky_mode, anthropic_req)
+    sticky_key, sticky_source, subagent_id = _derive_sticky_key(session_id, anthropic_req)
 
     allocator = _get_or_create_model_allocator(model, slots)
     slot_id, is_new = allocator.assign(sticky_key)
