@@ -245,11 +245,14 @@ _model_allocators: dict[str, StickySlotAllocator] = {}
 
 @dataclass
 class RequestMetricsContext:
+    request_id: str
     provider_key: str
     provider_name: str
     dp_rank: int | None
     started_at: float
     is_stream: bool
+    input_tokens: int = 0
+    tokenizer_path: str | None = None
 
 
 class RuntimeMetrics:
@@ -274,6 +277,7 @@ class RuntimeMetrics:
             self.total_latency_sec = 0.0
             self._provider_stats: dict[str, dict] = {}
             self._recent_completions: deque[dict] = deque()
+            self._active_request_tokens: dict[str, dict] = {}
 
     def _ensure_provider_stats(self, provider_key: str, provider_name: str) -> dict:
         stats = self._provider_stats.get(provider_key)
@@ -319,8 +323,12 @@ class RuntimeMetrics:
         provider_name: str,
         dp_rank: int | None,
         is_stream: bool,
+        *,
+        input_tokens: int = 0,
+        tokenizer_path: str | None = None,
     ) -> RequestMetricsContext:
         started_at = time.monotonic()
+        request_id = uuid.uuid4().hex
         with self._lock:
             self.requests_started += 1
             self.active_requests += 1
@@ -346,13 +354,96 @@ class RuntimeMetrics:
                 else:
                     dp_stats["non_streaming_requests_started"] += 1
 
+            self._active_request_tokens[request_id] = {
+                "provider_key": provider_key,
+                "provider_name": provider_name,
+                "dp_rank": dp_rank,
+                "input_tokens": int(input_tokens),
+                "output_tokens": 0,
+            }
+
         return RequestMetricsContext(
+            request_id=request_id,
             provider_key=provider_key,
             provider_name=provider_name,
             dp_rank=dp_rank,
             started_at=started_at,
             is_stream=is_stream,
+            input_tokens=int(input_tokens),
+            tokenizer_path=tokenizer_path,
         )
+
+    def update_request_route(
+        self,
+        ctx: RequestMetricsContext,
+        *,
+        provider_key: str,
+        provider_name: str,
+        dp_rank: int | None,
+    ) -> None:
+        with self._lock:
+            active = self._active_request_tokens.get(ctx.request_id)
+            if active is not None:
+                active["provider_key"] = provider_key
+                active["provider_name"] = provider_name
+                active["dp_rank"] = dp_rank
+            old_provider_stats = self._ensure_provider_stats(ctx.provider_key, ctx.provider_name)
+            old_provider_stats["requests_started"] = max(old_provider_stats["requests_started"] - 1, 0)
+            old_provider_stats["active_requests"] = max(old_provider_stats["active_requests"] - 1, 0)
+            if ctx.is_stream:
+                old_provider_stats["streaming_requests_started"] = max(
+                    old_provider_stats["streaming_requests_started"] - 1,
+                    0,
+                )
+            else:
+                old_provider_stats["non_streaming_requests_started"] = max(
+                    old_provider_stats["non_streaming_requests_started"] - 1,
+                    0,
+                )
+            if ctx.dp_rank is not None:
+                old_dp_stats = self._ensure_dp_stats(old_provider_stats, ctx.dp_rank)
+                old_dp_stats["requests_started"] = max(old_dp_stats["requests_started"] - 1, 0)
+                old_dp_stats["active_requests"] = max(old_dp_stats["active_requests"] - 1, 0)
+                if ctx.is_stream:
+                    old_dp_stats["streaming_requests_started"] = max(
+                        old_dp_stats["streaming_requests_started"] - 1,
+                        0,
+                    )
+                else:
+                    old_dp_stats["non_streaming_requests_started"] = max(
+                        old_dp_stats["non_streaming_requests_started"] - 1,
+                        0,
+                    )
+
+            new_provider_stats = self._ensure_provider_stats(provider_key, provider_name)
+            new_provider_stats["requests_started"] += 1
+            new_provider_stats["active_requests"] += 1
+            if ctx.is_stream:
+                new_provider_stats["streaming_requests_started"] += 1
+            else:
+                new_provider_stats["non_streaming_requests_started"] += 1
+            if dp_rank is not None:
+                new_dp_stats = self._ensure_dp_stats(new_provider_stats, dp_rank)
+                new_dp_stats["requests_started"] += 1
+                new_dp_stats["active_requests"] += 1
+                if ctx.is_stream:
+                    new_dp_stats["streaming_requests_started"] += 1
+                else:
+                    new_dp_stats["non_streaming_requests_started"] += 1
+        ctx.provider_key = provider_key
+        ctx.provider_name = provider_name
+        ctx.dp_rank = dp_rank
+
+    def update_request_output_tokens(
+        self,
+        ctx: RequestMetricsContext,
+        output_tokens: int,
+    ) -> None:
+        with self._lock:
+            active = self._active_request_tokens.get(ctx.request_id)
+            if active is None:
+                return
+            active["output_tokens"] = max(int(output_tokens), 0)
 
     def finish_request(
         self,
@@ -369,6 +460,7 @@ class RuntimeMetrics:
 
         with self._lock:
             self.active_requests = max(self.active_requests - 1, 0)
+            self._active_request_tokens.pop(ctx.request_id, None)
             provider_stats = self._ensure_provider_stats(ctx.provider_key, ctx.provider_name)
             provider_stats["active_requests"] = max(provider_stats["active_requests"] - 1, 0)
 
@@ -416,9 +508,41 @@ class RuntimeMetrics:
         with self._lock:
             self._prune_locked(now)
             throughput = self._throughput_from_events(self._recent_completions)
+            active_by_provider: dict[str, dict[str, int | str | dict[int, dict[str, int]]]] = {}
+            active_input_tokens = 0
+            active_output_tokens = 0
+            for active in self._active_request_tokens.values():
+                provider_key = str(active["provider_key"])
+                dp_rank = active["dp_rank"]
+                req_input_tokens = int(active["input_tokens"])
+                req_output_tokens = int(active["output_tokens"])
+                active_input_tokens += req_input_tokens
+                active_output_tokens += req_output_tokens
+                provider_active = active_by_provider.setdefault(provider_key, {
+                    "provider_name": str(active["provider_name"]),
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "per_dp": {},
+                })
+                provider_active["provider_name"] = str(active["provider_name"])
+                provider_active["input_tokens"] += req_input_tokens
+                provider_active["output_tokens"] += req_output_tokens
+                if dp_rank is not None:
+                    per_dp = provider_active["per_dp"]
+                    dp_active = per_dp.setdefault(int(dp_rank), {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                    })
+                    dp_active["input_tokens"] += req_input_tokens
+                    dp_active["output_tokens"] += req_output_tokens
             providers: dict[str, dict] = {}
             for provider_key, stats in self._provider_stats.items():
                 provider_events = [e for e in self._recent_completions if e["provider_key"] == provider_key]
+                provider_active = active_by_provider.get(provider_key, {})
+                completed_input_tokens = stats["input_tokens"]
+                completed_output_tokens = stats["output_tokens"]
+                provider_active_input = int(provider_active.get("input_tokens", 0))
+                provider_active_output = int(provider_active.get("output_tokens", 0))
                 provider_snapshot = {
                     "provider_name": stats["provider_name"],
                     "requests_started": stats["requests_started"],
@@ -427,9 +551,18 @@ class RuntimeMetrics:
                     "streaming_requests_started": stats["streaming_requests_started"],
                     "non_streaming_requests_started": stats["non_streaming_requests_started"],
                     "active_requests": stats["active_requests"],
-                    "input_tokens": stats["input_tokens"],
-                    "output_tokens": stats["output_tokens"],
-                    "total_tokens": stats["input_tokens"] + stats["output_tokens"],
+                    "completed_input_tokens": completed_input_tokens,
+                    "completed_output_tokens": completed_output_tokens,
+                    "completed_total_tokens": completed_input_tokens + completed_output_tokens,
+                    "active_input_tokens": provider_active_input,
+                    "active_output_tokens": provider_active_output,
+                    "active_total_tokens": provider_active_input + provider_active_output,
+                    "input_tokens": completed_input_tokens + provider_active_input,
+                    "output_tokens": completed_output_tokens + provider_active_output,
+                    "total_tokens": (
+                        completed_input_tokens + completed_output_tokens
+                        + provider_active_input + provider_active_output
+                    ),
                     "avg_latency_sec": (
                         stats["total_latency_sec"] / stats["requests_completed"]
                         if stats["requests_completed"] else 0.0
@@ -442,6 +575,11 @@ class RuntimeMetrics:
                         e for e in provider_events
                         if e["dp_rank"] == dp_rank
                     ]
+                    dp_active = provider_active.get("per_dp", {}).get(dp_rank, {})
+                    completed_dp_input_tokens = dp_stats["input_tokens"]
+                    completed_dp_output_tokens = dp_stats["output_tokens"]
+                    active_dp_input_tokens = int(dp_active.get("input_tokens", 0))
+                    active_dp_output_tokens = int(dp_active.get("output_tokens", 0))
                     provider_snapshot["per_dp"][dp_rank] = {
                         "requests_started": dp_stats["requests_started"],
                         "requests_completed": dp_stats["requests_completed"],
@@ -449,9 +587,18 @@ class RuntimeMetrics:
                         "streaming_requests_started": dp_stats["streaming_requests_started"],
                         "non_streaming_requests_started": dp_stats["non_streaming_requests_started"],
                         "active_requests": dp_stats["active_requests"],
-                        "input_tokens": dp_stats["input_tokens"],
-                        "output_tokens": dp_stats["output_tokens"],
-                        "total_tokens": dp_stats["input_tokens"] + dp_stats["output_tokens"],
+                        "completed_input_tokens": completed_dp_input_tokens,
+                        "completed_output_tokens": completed_dp_output_tokens,
+                        "completed_total_tokens": completed_dp_input_tokens + completed_dp_output_tokens,
+                        "active_input_tokens": active_dp_input_tokens,
+                        "active_output_tokens": active_dp_output_tokens,
+                        "active_total_tokens": active_dp_input_tokens + active_dp_output_tokens,
+                        "input_tokens": completed_dp_input_tokens + active_dp_input_tokens,
+                        "output_tokens": completed_dp_output_tokens + active_dp_output_tokens,
+                        "total_tokens": (
+                            completed_dp_input_tokens + completed_dp_output_tokens
+                            + active_dp_input_tokens + active_dp_output_tokens
+                        ),
                         "avg_latency_sec": (
                             dp_stats["total_latency_sec"] / dp_stats["requests_completed"]
                             if dp_stats["requests_completed"] else 0.0
@@ -470,9 +617,15 @@ class RuntimeMetrics:
                 "streaming_requests_started": self.streaming_requests_started,
                 "non_streaming_requests_started": self.non_streaming_requests_started,
                 "active_requests": self.active_requests,
-                "input_tokens": self.input_tokens,
-                "output_tokens": self.output_tokens,
-                "total_tokens": self.input_tokens + self.output_tokens,
+                "completed_input_tokens": self.input_tokens,
+                "completed_output_tokens": self.output_tokens,
+                "completed_total_tokens": self.input_tokens + self.output_tokens,
+                "active_input_tokens": active_input_tokens,
+                "active_output_tokens": active_output_tokens,
+                "active_total_tokens": active_input_tokens + active_output_tokens,
+                "input_tokens": self.input_tokens + active_input_tokens,
+                "output_tokens": self.output_tokens + active_output_tokens,
+                "total_tokens": self.input_tokens + self.output_tokens + active_input_tokens + active_output_tokens,
                 "avg_latency_sec": (
                     self.total_latency_sec / self.requests_completed
                     if self.requests_completed else 0.0
@@ -1262,6 +1415,17 @@ def _resolve_tokenizer_path(provider: dict) -> str | None:
     )
 
 
+async def _count_request_input_tokens(provider: dict, model: str, openai_req: dict) -> tuple[int, str | None]:
+    tokenizer_path = _resolve_tokenizer_path(provider)
+    prompt_text = _extract_text_for_counting(openai_req)
+    backend_count = await _count_tokens_via_sglang(provider, model, prompt_text)
+    if backend_count is not None:
+        return backend_count, tokenizer_path
+    if not tokenizer_path:
+        return 0, None
+    return _count_tokens_in_openai_req(openai_req, tokenizer_path), tokenizer_path
+
+
 def _normalize_openai_usage(usage: dict | None) -> dict:
     usage = usage or {}
     prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
@@ -1369,6 +1533,12 @@ async def messages(request: Request):
     headers = _provider_headers(provider)
     max_retries: int = provider.get("max_retries", 3)
     timeout = _timeout()
+    tokenizer_path = _resolve_tokenizer_path(provider)
+    try:
+        input_tokens, _ = await _count_request_input_tokens(provider, model, openai_req)
+    except Exception:
+        logger.exception("Realtime input token counting failed")
+        input_tokens = 0
 
     is_stream = openai_req.get("stream", False)
     metrics_ctx = _runtime_metrics.start_request(
@@ -1376,6 +1546,8 @@ async def messages(request: Request):
         provider_name=provider.get("name", ""),
         dp_rank=dp_decision.provider_dp_rank,
         is_stream=is_stream,
+        input_tokens=input_tokens,
+        tokenizer_path=tokenizer_path,
     )
 
     if is_stream:
@@ -1394,11 +1566,15 @@ async def messages(request: Request):
                 provider = selected_slot.provider
                 url = provider["api_base_url"]
                 headers = _provider_headers(provider)
+                metrics_ctx.tokenizer_path = _resolve_tokenizer_path(provider)
                 try:
                     stream = await open_provider_stream(url, headers, openai_req, timeout, max_retries)
-                    metrics_ctx.provider_key = _dp_cache_key(provider)
-                    metrics_ctx.provider_name = provider.get("name", "")
-                    metrics_ctx.dp_rank = dp_decision.provider_dp_rank
+                    _runtime_metrics.update_request_route(
+                        metrics_ctx,
+                        provider_key=_dp_cache_key(provider),
+                        provider_name=provider.get("name", ""),
+                        dp_rank=dp_decision.provider_dp_rank,
+                    )
                 except ProviderError as retry_exc:
                     _runtime_metrics.finish_request(metrics_ctx, success=False)
                     raise HTTPException(retry_exc.status or 502, retry_exc.body or str(retry_exc))
@@ -1437,10 +1613,14 @@ async def messages(request: Request):
             provider = selected_slot.provider
             url = provider["api_base_url"]
             headers = _provider_headers(provider)
+            metrics_ctx.tokenizer_path = _resolve_tokenizer_path(provider)
             try:
-                metrics_ctx.provider_key = _dp_cache_key(provider)
-                metrics_ctx.provider_name = provider.get("name", "")
-                metrics_ctx.dp_rank = dp_decision.provider_dp_rank
+                _runtime_metrics.update_request_route(
+                    metrics_ctx,
+                    provider_key=_dp_cache_key(provider),
+                    provider_name=provider.get("name", ""),
+                    dp_rank=dp_decision.provider_dp_rank,
+                )
                 openai_resp = await post_json(
                     url, headers, openai_req, timeout=timeout, max_retries=max_retries
                 )
@@ -1480,6 +1660,13 @@ async def _stream_response(
     _text_buf: list[str] | None = [] if _debug_enabled() else None
     usage: dict | None = None
     completed = False
+    output_tokenizer = None
+    output_parts: list[str] = []
+    if metrics_ctx is not None and metrics_ctx.tokenizer_path:
+        try:
+            output_tokenizer = _get_tokenizer(metrics_ctx.tokenizer_path)
+        except Exception:
+            logger.debug("Realtime output tokenizer unavailable", exc_info=True)
 
     try:
         async for event in stream_openai_to_anthropic(stream, message_id, model):
@@ -1492,6 +1679,29 @@ async def _stream_response(
                     continue
                 if parsed.get("type") == "message_delta" and isinstance(parsed.get("usage"), dict):
                     usage = _usage_from_anthropic_message(parsed)
+                elif (
+                    output_tokenizer is not None
+                    and parsed.get("type") == "content_block_delta"
+                    and isinstance(parsed.get("delta"), dict)
+                ):
+                    delta = parsed["delta"]
+                    piece = ""
+                    if delta.get("type") == "text_delta":
+                        piece = delta.get("text") or ""
+                    elif delta.get("type") == "thinking_delta":
+                        piece = delta.get("thinking") or ""
+                    elif delta.get("type") == "input_json_delta":
+                        piece = delta.get("partial_json") or ""
+                    if piece:
+                        output_parts.append(piece)
+                        try:
+                            estimated_tokens = len(output_tokenizer.encode("".join(output_parts)))
+                        except Exception:
+                            logger.debug("Realtime output token estimation failed", exc_info=True)
+                            output_tokenizer = None
+                        else:
+                            if metrics_ctx is not None:
+                                _runtime_metrics.update_request_output_tokens(metrics_ctx, estimated_tokens)
             # Accumulate text for debug check (zero cost when CCR_DEBUG is off)
             if _text_buf is not None:
                 for line in event.split("\n"):
@@ -1545,16 +1755,8 @@ async def count_tokens(request: Request):
     openai_req = anthropic_to_openai(body)
     openai_req = apply_provider_params(provider, openai_req)
 
-    prompt_text = _extract_text_for_counting(openai_req)
-    backend_count = await _count_tokens_via_sglang(provider, model, prompt_text)
-    if backend_count is not None:
-        return {"input_tokens": backend_count}
-
-    tokenizer_path = _resolve_tokenizer_path(provider)
-    if not tokenizer_path:
-        return {"input_tokens": 0}
     try:
-        input_tokens = _count_tokens_in_openai_req(openai_req, tokenizer_path)
+        input_tokens, _ = await _count_request_input_tokens(provider, model, openai_req)
     except Exception as exc:
         logger.exception("Token counting error")
         raise HTTPException(500, f"Token counting failed: {exc}")
@@ -2049,6 +2251,12 @@ async def metrics():
             "streaming_requests_started": 0,
             "non_streaming_requests_started": 0,
             "active_requests": 0,
+            "completed_input_tokens": 0,
+            "completed_output_tokens": 0,
+            "completed_total_tokens": 0,
+            "active_input_tokens": 0,
+            "active_output_tokens": 0,
+            "active_total_tokens": 0,
             "input_tokens": 0,
             "output_tokens": 0,
             "total_tokens": 0,
@@ -2083,6 +2291,12 @@ async def metrics():
                 "requests_failed": dp_stats.get("requests_failed", 0),
                 "streaming_requests_started": dp_stats.get("streaming_requests_started", 0),
                 "non_streaming_requests_started": dp_stats.get("non_streaming_requests_started", 0),
+                "completed_input_tokens": dp_stats.get("completed_input_tokens", 0),
+                "completed_output_tokens": dp_stats.get("completed_output_tokens", 0),
+                "completed_total_tokens": dp_stats.get("completed_total_tokens", 0),
+                "active_input_tokens": dp_stats.get("active_input_tokens", 0),
+                "active_output_tokens": dp_stats.get("active_output_tokens", 0),
+                "active_total_tokens": dp_stats.get("active_total_tokens", 0),
                 "input_tokens": dp_stats.get("input_tokens", 0),
                 "output_tokens": dp_stats.get("output_tokens", 0),
                 "total_tokens": dp_stats.get("total_tokens", 0),
@@ -2107,6 +2321,12 @@ async def metrics():
             "requests_failed": provider_stats["requests_failed"],
             "streaming_requests_started": provider_stats["streaming_requests_started"],
             "non_streaming_requests_started": provider_stats["non_streaming_requests_started"],
+            "completed_input_tokens": provider_stats["completed_input_tokens"],
+            "completed_output_tokens": provider_stats["completed_output_tokens"],
+            "completed_total_tokens": provider_stats["completed_total_tokens"],
+            "active_input_tokens": provider_stats["active_input_tokens"],
+            "active_output_tokens": provider_stats["active_output_tokens"],
+            "active_total_tokens": provider_stats["active_total_tokens"],
             "input_tokens": provider_stats["input_tokens"],
             "output_tokens": provider_stats["output_tokens"],
             "total_tokens": provider_stats["total_tokens"],
@@ -2127,6 +2347,12 @@ async def metrics():
             "requests_failed": snapshot["requests_failed"],
             "streaming_requests_started": snapshot["streaming_requests_started"],
             "non_streaming_requests_started": snapshot["non_streaming_requests_started"],
+            "completed_input_tokens": snapshot["completed_input_tokens"],
+            "completed_output_tokens": snapshot["completed_output_tokens"],
+            "completed_total_tokens": snapshot["completed_total_tokens"],
+            "active_input_tokens": snapshot["active_input_tokens"],
+            "active_output_tokens": snapshot["active_output_tokens"],
+            "active_total_tokens": snapshot["active_total_tokens"],
             "input_tokens": snapshot["input_tokens"],
             "output_tokens": snapshot["output_tokens"],
             "total_tokens": snapshot["total_tokens"],

@@ -1948,6 +1948,7 @@ class TestMetricsEndpoint(unittest.IsolatedAsyncioTestCase):
             return self._openai_resp()
 
         with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
+             patch.object(self.srv, "_count_request_input_tokens", new=AsyncMock(return_value=(17, "/models/tokenizer"))), \
              patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
             request_task = asyncio.create_task(self.client.post(
                 "/v1/messages",
@@ -1963,13 +1964,21 @@ class TestMetricsEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metrics_resp.status_code, 200, metrics_resp.text)
         data = metrics_resp.json()
         self.assertEqual(data["totals"]["active_requests"], 1)
+        self.assertEqual(data["totals"]["active_input_tokens"], 17)
+        self.assertEqual(data["totals"]["active_output_tokens"], 0)
+        self.assertEqual(data["totals"]["completed_input_tokens"], 0)
+        self.assertEqual(data["totals"]["input_tokens"], 17)
         provider = data["providers"][0]
         self.assertEqual(provider["active_requests"], 1)
+        self.assertEqual(provider["active_input_tokens"], 17)
+        self.assertEqual(provider["completed_input_tokens"], 0)
         self.assertEqual(provider["per_dp"][0]["rank"], 0)
         self.assertEqual(provider["per_dp"][0]["active_requests"], 1)
+        self.assertEqual(provider["per_dp"][0]["active_input_tokens"], 17)
 
     async def test_metrics_reports_completed_request_throughput_sessions_and_tokens(self):
         with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
+             patch.object(self.srv, "_count_request_input_tokens", new=AsyncMock(return_value=(17, "/models/tokenizer"))), \
              patch.object(self.srv, "post_json", new=AsyncMock(return_value=self._openai_resp(completion_tokens=5))):
             response = await self.client.post(
                 "/v1/messages",
@@ -1985,6 +1994,10 @@ class TestMetricsEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["totals"]["requests_completed"], 1)
         self.assertEqual(data["totals"]["input_tokens"], 10)
         self.assertEqual(data["totals"]["output_tokens"], 5)
+        self.assertEqual(data["totals"]["active_input_tokens"], 0)
+        self.assertEqual(data["totals"]["active_output_tokens"], 0)
+        self.assertEqual(data["totals"]["completed_input_tokens"], 10)
+        self.assertEqual(data["totals"]["completed_output_tokens"], 5)
         self.assertGreater(data["totals"]["throughput"]["total_tokens_per_sec"], 0.0)
 
         provider = data["providers"][0]
@@ -1992,9 +2005,12 @@ class TestMetricsEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provider["dp_size"], 4)
         self.assertEqual(provider["total_sessions"], 1)
         self.assertEqual(provider["requests_completed"], 1)
+        self.assertEqual(provider["completed_input_tokens"], 10)
+        self.assertEqual(provider["active_input_tokens"], 0)
         self.assertEqual(provider["per_dp"][0]["rank"], 0)
         self.assertEqual(provider["per_dp"][0]["sessions"], 1)
         self.assertEqual(provider["per_dp"][0]["requests_completed"], 1)
+        self.assertEqual(provider["per_dp"][0]["completed_input_tokens"], 10)
         self.assertEqual(provider["per_dp"][0]["output_tokens"], 5)
         self.assertGreater(provider["per_dp"][0]["throughput"]["output_tokens_per_sec"], 0.0)
 
@@ -2024,6 +2040,7 @@ class TestMetricsEndpoint(unittest.IsolatedAsyncioTestCase):
         ]
 
         with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
+             patch.object(self.srv, "_count_request_input_tokens", new=AsyncMock(return_value=(17, "/models/tokenizer"))), \
              patch.object(self.srv, "open_provider_stream", new=AsyncMock(return_value=FakeProviderStream(stream_lines))):
             response = await self.client.post(
                 "/v1/messages",
@@ -2039,11 +2056,68 @@ class TestMetricsEndpoint(unittest.IsolatedAsyncioTestCase):
         data = metrics_resp.json()
         self.assertEqual(data["totals"]["streaming_requests_started"], 1)
         self.assertEqual(data["totals"]["requests_completed"], 1)
+        self.assertEqual(data["totals"]["completed_input_tokens"], 12)
+        self.assertEqual(data["totals"]["completed_output_tokens"], 3)
         provider = data["providers"][0]
         self.assertEqual(provider["streaming_requests_started"], 1)
         self.assertEqual(provider["per_dp"][0]["requests_completed"], 1)
         self.assertEqual(provider["per_dp"][0]["input_tokens"], 12)
         self.assertEqual(provider["per_dp"][0]["output_tokens"], 3)
+
+    async def test_metrics_estimates_streaming_output_tokens_while_active(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class FakeTokenizer:
+            def encode(self, text):
+                return list(text)
+
+        class FakeProviderStream:
+            async def __aiter__(self):
+                entered.set()
+                yield ("data: " + json.dumps({
+                    "id": "x",
+                    "choices": [{"index": 0, "delta": {"content": "PONG"}, "finish_reason": None}],
+                })).encode()
+                await release.wait()
+                yield ("data: " + json.dumps({
+                    "id": "x",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 3},
+                })).encode()
+                yield b"data: [DONE]"
+
+            async def aclose(self):
+                return None
+
+        provider = self.srv._config["Providers"][0]
+        provider_key = self.srv._dp_cache_key(provider)
+        metrics_ctx = self.srv._runtime_metrics.start_request(
+            provider_key=provider_key,
+            provider_name=provider["name"],
+            dp_rank=0,
+            is_stream=True,
+            input_tokens=17,
+            tokenizer_path="/models/tokenizer",
+        )
+
+        with patch.object(self.srv, "_get_tokenizer", return_value=FakeTokenizer()):
+            agen = self.srv._stream_response({}, FakeProviderStream(), "default", metrics_ctx=metrics_ctx)
+            for _ in range(4):
+                await agen.__anext__()
+            await entered.wait()
+            data = self.srv._runtime_metrics.snapshot()
+            release.set()
+            await agen.aclose()
+
+        self.assertEqual(data["active_requests"], 1)
+        self.assertEqual(data["active_input_tokens"], 17)
+        self.assertGreater(data["active_output_tokens"], 0)
+        self.assertEqual(data["completed_output_tokens"], 0)
+        self.assertGreater(data["output_tokens"], 0)
+        provider_snapshot = data["providers"][provider_key]
+        self.assertGreater(provider_snapshot["active_output_tokens"], 0)
+        self.assertGreater(provider_snapshot["per_dp"][0]["active_output_tokens"], 0)
 
 
 # ============================================================================
