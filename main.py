@@ -39,7 +39,7 @@ def main() -> None:
 
     print(f"Starting Claude Code Router on {host}:{port}", flush=True)
 
-    set_config(cfg)
+    set_config(cfg, source_path=config_path)
     uvicorn.run(app, host=host, port=port, log_level=log_level)
 
 

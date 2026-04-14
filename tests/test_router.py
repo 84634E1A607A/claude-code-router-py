@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -614,6 +615,19 @@ class TestProviderStreamRetry(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(got, [b"data: hello"])
 
 
+class TestUpstreamTimeout(unittest.TestCase):
+
+    def test_upstream_timeout_caps_connect_phase_only(self):
+        from client import upstream_timeout
+
+        timeout = upstream_timeout(120.0)
+
+        self.assertEqual(timeout.connect, 3.0)
+        self.assertEqual(timeout.read, 120.0)
+        self.assertEqual(timeout.write, 120.0)
+        self.assertEqual(timeout.pool, 120.0)
+
+
 # ============================================================================
 # Unit — config + apply_provider_params
 # ============================================================================
@@ -765,6 +779,105 @@ class TestLifespanConfigLoading(unittest.IsolatedAsyncioTestCase):
             async with srv_mod.lifespan(srv_mod.app):
                 self.assertIn("/model", srv_mod._providers_by_model)
                 self.assertEqual(srv_mod._available_models, ("/model",))
+
+    async def test_lifespan_hot_reloads_changed_config_file(self):
+        import server as srv_mod
+
+        srv_mod.set_config({})
+        initial = {
+            "Providers": [
+                {
+                    "name": "default",
+                    "model": "/model",
+                    "api_base_url": "http://host/v1/chat/completions",
+                }
+            ],
+            "Router": {"default": "/model"},
+        }
+        updated = {
+            "Providers": [
+                {
+                    "name": "updated",
+                    "model": "/new-model",
+                    "api_base_url": "http://updated/v1/chat/completions",
+                }
+            ],
+            "Router": {"default": "/new-model"},
+        }
+
+        with tempfile.NamedTemporaryFile("w+", suffix=".json", delete=False) as tmp:
+            json.dump(initial, tmp)
+            tmp.flush()
+            path = tmp.name
+
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "CCR_CONFIG": path,
+                    "CCR_CONFIG_RELOAD_INTERVAL_SEC": "0.1",
+                },
+                clear=True,
+            ):
+                async with srv_mod.lifespan(srv_mod.app):
+                    self.assertEqual(srv_mod._available_models, ("/model",))
+
+                    await asyncio.sleep(0.12)
+                    with open(path, "w", encoding="utf-8") as handle:
+                        json.dump(updated, handle)
+
+                    for _ in range(20):
+                        if srv_mod._available_models == ("/new-model",):
+                            break
+                        await asyncio.sleep(0.05)
+
+                    self.assertEqual(srv_mod._available_models, ("/new-model",))
+                    self.assertEqual(srv_mod._config["Router"]["default"], "/new-model")
+        finally:
+            os.unlink(path)
+
+    async def test_lifespan_keeps_previous_config_on_invalid_reload(self):
+        import server as srv_mod
+
+        srv_mod.set_config({})
+        initial = {
+            "Providers": [
+                {
+                    "name": "default",
+                    "model": "/model",
+                    "api_base_url": "http://host/v1/chat/completions",
+                }
+            ],
+            "Router": {"default": "/model"},
+        }
+
+        with tempfile.NamedTemporaryFile("w+", suffix=".json", delete=False) as tmp:
+            json.dump(initial, tmp)
+            tmp.flush()
+            path = tmp.name
+
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "CCR_CONFIG": path,
+                    "CCR_CONFIG_RELOAD_INTERVAL_SEC": "0.1",
+                },
+                clear=True,
+            ):
+                async with srv_mod.lifespan(srv_mod.app):
+                    self.assertEqual(srv_mod._available_models, ("/model",))
+
+                    await asyncio.sleep(0.12)
+                    with open(path, "w", encoding="utf-8") as handle:
+                        json.dump({"Providers": []}, handle)
+
+                    await asyncio.sleep(0.25)
+
+                    self.assertEqual(srv_mod._available_models, ("/model",))
+                    self.assertEqual(srv_mod._config["Router"]["default"], "/model")
+        finally:
+            os.unlink(path)
 
 
 class TestTokenCounting(unittest.TestCase):
@@ -1629,6 +1742,51 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.headers["X-Router-Sticky-Key"], f"claude-session:{expected_first}")
         self.assertEqual(second.headers["X-Router-Sticky-Key"], f"claude-session:{expected_second}")
         self.assertEqual(third.headers["X-Router-Sticky-Key"], f"claude-session:{expected_first}")
+
+    async def test_reassigns_dp_rank_when_selected_rank_is_busy_and_another_is_idle(self):
+        sent_bodies = []
+        session_id = "hot-session"
+        provider = self.srv._config["Providers"][0]
+        provider_key = self.srv._dp_cache_key(provider)
+        slots = [
+            self.srv.RoutingSlot(
+                flat_index=rank,
+                slot_id=self.srv._provider_slot_id(provider, rank),
+                provider=provider,
+                provider_key=provider_key,
+                provider_name=provider["name"],
+                model="/model",
+                provider_dp_rank=rank,
+                dp_size=2,
+            )
+            for rank in range(2)
+        ]
+        allocator = self.srv._get_or_create_model_allocator("/model", slots)
+        allocator.assign(session_id)
+
+        ctx_one = self.srv._runtime_metrics.start_request(provider_key, provider["name"], 0, False)
+        ctx_two = self.srv._runtime_metrics.start_request(provider_key, provider["name"], 0, False)
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_bodies.append(dict(body))
+            return self._openai_resp()
+
+        try:
+            with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=2)), \
+                 patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+                resp = await self.client.post(
+                    "/v1/messages",
+                    json=self._messages_req(),
+                    headers={self.srv._CLAUDE_SESSION_HEADER: session_id},
+                )
+        finally:
+            self.srv._runtime_metrics.finish_request(ctx_one, success=False)
+            self.srv._runtime_metrics.finish_request(ctx_two, success=False)
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(sent_bodies[0]["routed_dp_rank"], 1)
+        self.assertEqual(resp.headers["X-Router-DP-Rank"], "1")
+        self.assertEqual(allocator.sessions[session_id], self.srv._provider_slot_id(provider, 1))
 
     async def test_invalid_rank_retries_once_with_refreshed_dp_size(self):
         """Test that when dp_size shrinks and stored rank becomes invalid, retry works."""

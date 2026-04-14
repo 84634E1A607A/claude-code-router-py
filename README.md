@@ -226,6 +226,8 @@ python main.py [--config PATH]
 2. `CCR_CONFIG`
 3. `config.json`
 
+当配置来自文件路径时，服务会自动轮询文件变更并热重载。默认轮询间隔为 `1` 秒，可通过 `CCR_CONFIG_RELOAD_INTERVAL_SEC` 调整。`CCR_CONFIG_JSON` 不支持热重载，且监听端口这类进程启动参数不会因配置变更而重新绑定。
+
 | Source | Usage |
 |---|---|
 | `--config PATH` | `python main.py --config /path/to/config.json` |

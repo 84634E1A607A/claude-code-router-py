@@ -3,6 +3,7 @@ FastAPI server — accepts Anthropic /v1/messages requests and forwards them
 to an OpenAI-compatible provider, converting formats in both directions.
 """
 
+import asyncio
 import json
 import hashlib
 import inspect
@@ -17,13 +18,22 @@ from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from batch import anthropic_batch_to_openai_jsonl, openai_batch_to_anthropic, openai_results_line_to_anthropic
-from client import ProviderError, ProviderStream, close_shared_client, get_shared_client, open_provider_stream, post_json
+from client import (
+    ProviderError,
+    ProviderStream,
+    close_shared_client,
+    get_shared_client,
+    open_provider_stream,
+    post_json,
+    upstream_timeout,
+)
 from config import (
     apply_provider_params,
     get_provider,
@@ -41,12 +51,15 @@ _config: dict = {}
 _dp_size_cache: dict[str, dict[str, float | int]] = {}
 _providers_by_model: dict[str, list[dict]] = {}
 _available_models: tuple[str, ...] = ()
+_config_path: str | None = None
+_config_signature: tuple[int, int] | None = None
 
 _CLAUDE_SESSION_HEADER = "X-Claude-Code-Session-Id"
 _DP_OVERRIDE_HEADER = "X-Routed-DP-Rank"
 _DP_SERVER_INFO_TTL_SEC = 30
 _INVALID_DP_RANK_RE = re.compile(r"routed_dp_rank.*out of range", re.IGNORECASE | re.DOTALL)
 _WHITESPACE_RE = re.compile(r"\s+")
+_CONFIG_RELOAD_INTERVAL_SEC = 1.0
 
 
 @dataclass
@@ -158,6 +171,23 @@ class StickySlotAllocator:
     def cleanup(self) -> int:
         """Public cleanup method for external use. Evicts expired sessions."""
         return self._cleanup(time.monotonic())
+
+    def reassign(self, sticky_key: str, slot_id: str) -> bool:
+        """Move a sticky key to a different valid slot."""
+        if slot_id not in self.slots:
+            return False
+
+        now = time.monotonic()
+        current_slot = self.sessions.get(sticky_key)
+        if current_slot == slot_id:
+            self.session_activity[sticky_key] = now
+            self.slot_last_used[slot_id] = now
+            return False
+
+        self.sessions[sticky_key] = slot_id
+        self.session_activity[sticky_key] = now
+        self.slot_last_used[slot_id] = now
+        return True
 
     def stats(self) -> dict:
         """Return allocation statistics for logging/debugging."""
@@ -460,6 +490,15 @@ class RuntimeMetrics:
             "output_tokens_per_sec": output_tokens / self.throughput_window_sec,
         }
 
+    def provider_dp_active_requests(self, provider_key: str, dp_size: int) -> dict[int, int]:
+        with self._lock:
+            provider_stats = self._provider_stats.get(provider_key, {})
+            per_dp = provider_stats.get("per_dp", {})
+            return {
+                dp_rank: int(per_dp.get(dp_rank, {}).get("active_requests", 0))
+                for dp_rank in range(dp_size)
+            }
+
 
 _runtime_metrics = RuntimeMetrics()
 
@@ -558,9 +597,26 @@ def _derive_dp_sticky_key(session_id: str, provider: dict, anthropic_req: dict) 
     return _derive_sticky_key(session_id, anthropic_req)
 
 
-def set_config(cfg: dict) -> None:
-    global _config, _providers_by_model, _available_models
+def _config_file_signature(path: str) -> tuple[int, int]:
+    stat = Path(path).stat()
+    return stat.st_mtime_ns, stat.st_size
+
+
+def _config_reload_interval_sec() -> float:
+    raw = os.environ.get("CCR_CONFIG_RELOAD_INTERVAL_SEC")
+    if raw is None:
+        return _CONFIG_RELOAD_INTERVAL_SEC
+    try:
+        return max(float(raw), 0.1)
+    except (TypeError, ValueError):
+        return _CONFIG_RELOAD_INTERVAL_SEC
+
+
+def set_config(cfg: dict, *, source_path: str | None = None) -> None:
+    global _config, _providers_by_model, _available_models, _config_path, _config_signature
     _config = validate_config(cfg) if cfg else cfg
+    _config_path = source_path
+    _config_signature = _config_file_signature(source_path) if source_path else None
     _providers_by_model = {}
     _available_models = ()
     if _config:
@@ -580,9 +636,49 @@ def set_config(cfg: dict) -> None:
     _runtime_metrics.reset()
 
 
+async def _watch_config_file(path: str, stop_event: asyncio.Event) -> None:
+    current_signature = _config_signature
+    interval_sec = _config_reload_interval_sec()
+    logger.info(
+        "Config hot reload enabled for %s interval_sec=%.1f",
+        path,
+        interval_sec,
+    )
+    while True:
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_sec)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        try:
+            next_signature = _config_file_signature(path)
+        except FileNotFoundError:
+            logger.warning("Config reload skipped: file not found: %s", path)
+            continue
+        except OSError as exc:
+            logger.warning("Config reload skipped: failed to stat %s: %s", path, exc)
+            continue
+
+        if next_signature == current_signature:
+            continue
+
+        try:
+            next_config = load_config(path)
+            set_config(next_config, source_path=path)
+        except Exception as exc:
+            logger.error("Config reload failed for %s: %s", path, exc)
+            continue
+
+        current_signature = _config_signature
+        logger.info("Config reloaded from %s", path)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _config
+    config_reload_stop = asyncio.Event()
+    config_reload_task: asyncio.Task | None = None
     if not _config:
         if inline := os.environ.get("CCR_CONFIG_JSON"):
             import json as _json
@@ -594,13 +690,18 @@ async def lifespan(app: FastAPI):
         else:
             path = os.environ.get("CCR_CONFIG", "config.json")
             try:
-                set_config(load_config(path))
+                set_config(load_config(path), source_path=path)
                 logger.info("Config loaded from %s (worker pid=%d)", path, os.getpid())
             except Exception as exc:
                 logger.error("Failed to load config %s: %s", path, exc)
+    if _config_path:
+        config_reload_task = asyncio.create_task(_watch_config_file(_config_path, config_reload_stop))
     if not _config:
         logger.warning("No config loaded — routes are registered but all proxy endpoints will return 500")
     yield
+    config_reload_stop.set()
+    if config_reload_task is not None:
+        await config_reload_task
     await close_shared_client()
 
 
@@ -869,7 +970,7 @@ async def _get_provider_dp_size(provider: dict, force_refresh: bool = False) -> 
     client = get_shared_client()
     timeout = _timeout()
     try:
-        resp = await client.get(url, headers=_provider_headers(provider), timeout=timeout)
+        resp = await client.get(url, headers=_provider_headers(provider), timeout=upstream_timeout(timeout))
         if resp.status_code >= 400:
             _dp_size_cache.pop(cache_key, None)
             logger.warning("DP routing disabled for %s: /get_server_info returned %d", provider.get("name"), resp.status_code)
@@ -947,6 +1048,42 @@ def _log_dp_routing(provider: dict, decision: DPRoutingDecision, remapped: bool 
     )
 
 
+def _maybe_reassign_dp_slot(
+    allocator: StickySlotAllocator,
+    sticky_key: str,
+    selected_slot: RoutingSlot,
+    slot_by_id: dict[str, RoutingSlot],
+) -> tuple[RoutingSlot, bool]:
+    current_rank = selected_slot.provider_dp_rank
+    dp_size = selected_slot.dp_size
+    if current_rank is None or not dp_size or dp_size <= 1:
+        return selected_slot, False
+
+    active_requests = _runtime_metrics.provider_dp_active_requests(selected_slot.provider_key, dp_size)
+    if active_requests.get(current_rank, 0) <= 1:
+        return selected_slot, False
+
+    for candidate_rank in range(dp_size):
+        if candidate_rank == current_rank or active_requests.get(candidate_rank, 0) != 0:
+            continue
+        candidate_slot_id = _provider_slot_id(selected_slot.provider, candidate_rank)
+        candidate_slot = slot_by_id.get(candidate_slot_id)
+        if candidate_slot is None:
+            continue
+        if allocator.reassign(sticky_key, candidate_slot_id):
+            logger.info(
+                "DP reassign provider=%s sticky_key=%s from_rank=%d to_rank=%d active_requests=%s",
+                selected_slot.provider_name,
+                sticky_key,
+                current_rank,
+                candidate_rank,
+                active_requests,
+            )
+            return candidate_slot, True
+
+    return selected_slot, False
+
+
 async def _resolve_dp_routing(
     request: Request,
     model: str,
@@ -995,6 +1132,7 @@ async def _resolve_dp_routing(
         allocator.session_activity.pop(sticky_key, None)
         slot_id, is_new = allocator.assign(sticky_key)
         selected_slot = slot_by_id[slot_id]
+    selected_slot, remapped = _maybe_reassign_dp_slot(allocator, sticky_key, selected_slot, slot_by_id)
 
     if selected_slot.provider_dp_rank is not None:
         openai_req["routed_dp_rank"] = selected_slot.provider_dp_rank
@@ -1022,6 +1160,15 @@ async def _resolve_dp_routing(
         is_new,
         len(allocator.sessions),
     )
+    if remapped:
+        logger.info(
+            "Routing remap applied: model=%s provider=%s session=%s slot=%d provider_dp_rank=%s",
+            model,
+            selected_slot.provider_name,
+            session_id[:8] + "..." if len(session_id) > 8 else session_id,
+            selected_slot.flat_index,
+            selected_slot.provider_dp_rank,
+        )
 
     return selected_slot, openai_req, decision
 
@@ -1434,7 +1581,7 @@ async def tokens_clear(request: Request):
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     try:
-        async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
+        async with httpx.AsyncClient(timeout=upstream_timeout(120), trust_env=False) as client:
             resp = await client.post(
                 url,
                 json=body,
@@ -1486,7 +1633,7 @@ async def list_models(before_id: str | None = None,
 
     try:
         client = get_shared_client()
-        r = await client.get(url, headers=headers, params=params, timeout=timeout)
+        r = await client.get(url, headers=headers, params=params, timeout=upstream_timeout(timeout))
         if r.status_code >= 400:
             raise HTTPException(r.status_code, r.text)
         data = r.json()
@@ -1519,7 +1666,7 @@ async def get_model(model_id: str):
 
     try:
         client = get_shared_client()
-        r = await client.get(url, headers=headers, timeout=timeout)
+        r = await client.get(url, headers=headers, timeout=upstream_timeout(timeout))
         if r.status_code >= 400:
             raise HTTPException(r.status_code, r.text)
         return _openai_model_to_anthropic(r.json())
@@ -1626,7 +1773,7 @@ async def legacy_complete(request: Request):
 
 async def _httpx_get(url: str, headers: dict, timeout: float, **kwargs) -> dict:
     client = get_shared_client()
-    r = await client.get(url, headers=headers, timeout=timeout, **kwargs)
+    r = await client.get(url, headers=headers, timeout=upstream_timeout(timeout), **kwargs)
     if r.status_code >= 400:
         raise HTTPException(r.status_code, r.text)
     return r.json()
@@ -1634,7 +1781,7 @@ async def _httpx_get(url: str, headers: dict, timeout: float, **kwargs) -> dict:
 
 async def _httpx_delete(url: str, headers: dict, timeout: float) -> dict:
     client = get_shared_client()
-    r = await client.delete(url, headers=headers, timeout=timeout)
+    r = await client.delete(url, headers=headers, timeout=upstream_timeout(timeout))
     if r.status_code >= 400:
         raise HTTPException(r.status_code, r.text)
     return r.json() if r.text else {}
@@ -1672,7 +1819,7 @@ async def create_batch(request: Request):
 
     try:
         # Upload input file (use a fresh client for multipart upload)
-        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+        async with httpx.AsyncClient(timeout=upstream_timeout(timeout), trust_env=False) as client:
             r = await client.post(
                 files_url,
                 headers={k: v for k, v in headers.items() if k != "Content-Type"},
@@ -1774,7 +1921,7 @@ async def cancel_batch(batch_id: str, request: Request):
         r = await client.post(
             _batches_url(provider) + f"/{batch_id}/cancel",
             headers=headers,
-            timeout=timeout,
+            timeout=upstream_timeout(timeout),
         )
         if r.status_code >= 400:
             raise HTTPException(r.status_code, r.text)
@@ -1837,7 +1984,7 @@ async def batch_results(batch_id: str, request: Request):
 
     async def _stream_results():
         url = _files_url(provider) + f"/{file_id}/content"
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout), trust_env=False) as client:
+        async with httpx.AsyncClient(timeout=upstream_timeout(timeout), trust_env=False) as client:
             async with client.stream("GET", url, headers=headers) as resp:
                 if resp.status_code >= 400:
                     body = await resp.aread()

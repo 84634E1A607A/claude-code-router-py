@@ -9,16 +9,22 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
+_CONNECT_TIMEOUT_SEC = 3.0
 
 # Shared HTTP client for non-streaming requests (connection pooling)
 _shared_client: httpx.AsyncClient | None = None
+
+
+def upstream_timeout(timeout: float) -> httpx.Timeout:
+    """Use a short TCP connect timeout without affecting established connections."""
+    return httpx.Timeout(timeout, connect=_CONNECT_TIMEOUT_SEC)
 
 
 def get_shared_client() -> httpx.AsyncClient:
     """Return the shared HTTP client (connection pooling). Created lazily."""
     global _shared_client
     if _shared_client is None:
-        _shared_client = httpx.AsyncClient(timeout=httpx.Timeout(600.0), trust_env=False)
+        _shared_client = httpx.AsyncClient(timeout=upstream_timeout(600.0), trust_env=False)
     return _shared_client
 
 
@@ -110,7 +116,7 @@ async def post_json(
             await asyncio.sleep(1)
 
         try:
-            resp = await client.post(url, headers=headers, json=body, timeout=timeout)
+            resp = await client.post(url, headers=headers, json=body, timeout=upstream_timeout(timeout))
         except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
             last_exc = exc
             logger.warning("Connection error (attempt %d): %s", attempt + 1, exc)
@@ -148,7 +154,7 @@ async def open_provider_stream(
     last_exc: Exception | None = None
 
     async def _connect() -> tuple[httpx.Response, httpx.AsyncClient]:
-        client = httpx.AsyncClient(timeout=httpx.Timeout(timeout), trust_env=False)
+        client = httpx.AsyncClient(timeout=upstream_timeout(timeout), trust_env=False)
         req = client.build_request("POST", url, headers=headers, json=body)
         try:
             resp = await client.send(req, stream=True)
@@ -193,4 +199,3 @@ async def open_provider_stream(
         )
 
     raise last_exc or ProviderError(0, "Unknown error after retries")
-
