@@ -1405,6 +1405,48 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.headers["X-Router-DP-Rank"], str(expected_rank))
         self.assertEqual(resp.headers["X-Router-Sticky-Key"], session_id)
 
+    async def test_messages_prefer_lower_active_requests_even_if_newer(self):
+        sent_bodies = []
+        provider = self.srv._config["Providers"][0]
+        provider_key = self.srv._dp_cache_key(provider)
+        slots = [
+            self.srv.RoutingSlot(
+                flat_index=rank,
+                slot_id=self.srv._provider_slot_id(provider, rank),
+                provider=provider,
+                provider_key=provider_key,
+                provider_name=provider["name"],
+                model="/model",
+                provider_dp_rank=rank,
+                dp_size=2,
+            )
+            for rank in range(2)
+        ]
+        allocator = self.srv._get_or_create_model_allocator("/model", slots)
+        allocator.slot_last_used[self.srv._provider_slot_id(provider, 0)] = 1.0
+        allocator.slot_last_used[self.srv._provider_slot_id(provider, 1)] = 10.0
+
+        active_ctx = self.srv._runtime_metrics.start_request(provider_key, provider["name"], 0, False)
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_bodies.append(dict(body))
+            return self._openai_resp()
+
+        try:
+            with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=2)), \
+                 patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+                resp = await self.client.post(
+                    "/v1/messages",
+                    json=self._messages_req(),
+                    headers={self.srv._CLAUDE_SESSION_HEADER: "load-sensitive-session"},
+                )
+        finally:
+            self.srv._runtime_metrics.finish_request(active_ctx, success=False)
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(sent_bodies[0]["routed_dp_rank"], 1)
+        self.assertEqual(resp.headers["X-Router-DP-Rank"], "1")
+
     async def test_exact_model_request_uses_matching_provider_pool(self):
         sent_bodies = []
         self.srv.set_config({

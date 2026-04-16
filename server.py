@@ -94,7 +94,7 @@ class StickySlotAllocator:
     Key properties:
     - Sessions are sticky forever (once assigned, never reassigned)
     - Multiple sessions can share the same slot
-    - New sessions get the slot with longest idle time
+    - New sessions get the slot with the fewest active requests, breaking ties by longest idle time
     - Sessions evicted after TTL of inactivity
     """
     slots: list[str]
@@ -103,7 +103,7 @@ class StickySlotAllocator:
     slot_last_used: dict[str, float] = field(default_factory=dict)  # slot_id -> timestamp
     session_activity: dict[str, float] = field(default_factory=dict)  # sticky_key -> timestamp
 
-    def assign(self, sticky_key: str) -> tuple[str, bool]:
+    def assign(self, sticky_key: str, *, slot_loads: dict[str, int] | None = None) -> tuple[str, bool]:
         """Assign a slot to a sticky key.
 
         Returns (slot_id, is_new) where is_new is True if this was a new assignment.
@@ -125,7 +125,7 @@ class StickySlotAllocator:
         if evicted > 0:
             logger.debug("DP lazy cleanup: evicted=%d sessions remaining=%d", evicted, len(self.sessions))
 
-        slot_id = self._select_slot()
+        slot_id = self._select_slot(slot_loads)
 
         self.sessions[sticky_key] = slot_id
         self.slot_last_used[slot_id] = now
@@ -151,22 +151,21 @@ class StickySlotAllocator:
 
         return len(to_evict)
 
-    def _select_slot(self) -> str:
-        """Select the best slot for a new sticky key."""
-        used_slots = set(self.slot_last_used.keys())
-        if len(used_slots) < len(self.slots):
-            for slot_id in self.slots:
-                if slot_id not in used_slots:
-                    return slot_id
+    def _slot_score(self, slot_id: str, slot_loads: dict[str, int] | None = None) -> tuple[int, float, int]:
+        active_requests = 0 if slot_loads is None else int(slot_loads.get(slot_id, 0))
+        last_used = self.slot_last_used.get(slot_id, 0.0)
+        return active_requests, last_used, self.slots.index(slot_id)
 
-        oldest_time = None
-        oldest_slot = self.slots[0]
-        for slot_id in self.slots:
-            last_used = self.slot_last_used.get(slot_id, 0.0)
-            if oldest_time is None or last_used < oldest_time:
-                oldest_time = last_used
-                oldest_slot = slot_id
-        return oldest_slot
+    def _select_slot(self, slot_loads: dict[str, int] | None = None) -> str:
+        """Select the best slot for a new sticky key."""
+        best_slot = self.slots[0]
+        best_score = self._slot_score(best_slot, slot_loads)
+        for slot_id in self.slots[1:]:
+            score = self._slot_score(slot_id, slot_loads)
+            if score < best_score:
+                best_slot = slot_id
+                best_score = score
+        return best_slot
 
     def cleanup(self) -> int:
         """Public cleanup method for external use. Evicts expired sessions."""
@@ -652,6 +651,11 @@ class RuntimeMetrics:
                 for dp_rank in range(dp_size)
             }
 
+    def provider_active_requests(self, provider_key: str) -> int:
+        with self._lock:
+            provider_stats = self._provider_stats.get(provider_key, {})
+            return int(provider_stats.get("active_requests", 0))
+
 
 _runtime_metrics = RuntimeMetrics()
 
@@ -978,6 +982,28 @@ def _slot_ttl_for_providers(providers: list[dict]) -> float:
     return ttl
 
 
+def _slot_loads_for_slots(slots: list[RoutingSlot]) -> dict[str, int]:
+    provider_dp_loads: dict[tuple[str, int], dict[int, int]] = {}
+    provider_loads: dict[str, int] = {}
+    slot_loads: dict[str, int] = {}
+    for slot in slots:
+        if slot.provider_dp_rank is not None and slot.dp_size and slot.dp_size > 1:
+            provider_key = (slot.provider_key, slot.dp_size)
+            dp_loads = provider_dp_loads.get(provider_key)
+            if dp_loads is None:
+                dp_loads = _runtime_metrics.provider_dp_active_requests(slot.provider_key, slot.dp_size)
+                provider_dp_loads[provider_key] = dp_loads
+            slot_loads[slot.slot_id] = int(dp_loads.get(slot.provider_dp_rank, 0))
+            continue
+
+        provider_load = provider_loads.get(slot.provider_key)
+        if provider_load is None:
+            provider_load = _runtime_metrics.provider_active_requests(slot.provider_key)
+            provider_loads[slot.provider_key] = provider_load
+        slot_loads[slot.slot_id] = provider_load
+    return slot_loads
+
+
 async def _build_routing_slots(model: str, *, force_refresh: bool = False) -> list[RoutingSlot]:
     providers = _providers_for_model(model)
     slots: list[RoutingSlot] = []
@@ -1213,26 +1239,37 @@ def _maybe_reassign_dp_slot(
         return selected_slot, False
 
     active_requests = _runtime_metrics.provider_dp_active_requests(selected_slot.provider_key, dp_size)
-    if active_requests.get(current_rank, 0) <= 1:
-        return selected_slot, False
+    current_active = int(active_requests.get(current_rank, 0))
+    current_slot_id = _provider_slot_id(selected_slot.provider, current_rank)
 
+    best_candidate: RoutingSlot | None = None
+    best_score: tuple[int, float, int] | None = None
     for candidate_rank in range(dp_size):
-        if candidate_rank == current_rank or active_requests.get(candidate_rank, 0) != 0:
-            continue
         candidate_slot_id = _provider_slot_id(selected_slot.provider, candidate_rank)
         candidate_slot = slot_by_id.get(candidate_slot_id)
         if candidate_slot is None:
             continue
-        if allocator.reassign(sticky_key, candidate_slot_id):
-            logger.info(
-                "DP reassign provider=%s sticky_key=%s from_rank=%d to_rank=%d active_requests=%s",
-                selected_slot.provider_name,
-                sticky_key,
-                current_rank,
-                candidate_rank,
-                active_requests,
-            )
-            return candidate_slot, True
+        candidate_active = int(active_requests.get(candidate_rank, 0))
+        if candidate_active >= current_active:
+            continue
+        score = (candidate_active, allocator.slot_last_used.get(candidate_slot_id, 0.0), candidate_rank)
+        if best_score is None or score < best_score:
+            best_score = score
+            best_candidate = candidate_slot
+
+    if best_candidate is None or best_candidate.slot_id == current_slot_id:
+        return selected_slot, False
+
+    if allocator.reassign(sticky_key, best_candidate.slot_id):
+        logger.info(
+            "DP reassign provider=%s sticky_key=%s from_rank=%d to_rank=%d active_requests=%s",
+            selected_slot.provider_name,
+            sticky_key,
+            current_rank,
+            best_candidate.provider_dp_rank,
+            active_requests,
+        )
+        return best_candidate, True
 
     return selected_slot, False
 
@@ -1249,6 +1286,7 @@ async def _resolve_dp_routing(
     if not slots:
         raise HTTPException(500, f"No routing slots available for model '{model}'")
     slot_by_id = {slot.slot_id: slot for slot in slots}
+    slot_loads = _slot_loads_for_slots(slots)
 
     override_rank = request.headers.get(_DP_OVERRIDE_HEADER)
     if override_rank is not None:
@@ -1278,12 +1316,12 @@ async def _resolve_dp_routing(
     sticky_key, sticky_source, subagent_id = _derive_sticky_key(session_id, anthropic_req)
 
     allocator = _get_or_create_model_allocator(model, slots)
-    slot_id, is_new = allocator.assign(sticky_key)
+    slot_id, is_new = allocator.assign(sticky_key, slot_loads=slot_loads)
     selected_slot = slot_by_id.get(slot_id)
     if selected_slot is None:
         allocator.sessions.pop(sticky_key, None)
         allocator.session_activity.pop(sticky_key, None)
-        slot_id, is_new = allocator.assign(sticky_key)
+        slot_id, is_new = allocator.assign(sticky_key, slot_loads=slot_loads)
         selected_slot = slot_by_id[slot_id]
     selected_slot, remapped = _maybe_reassign_dp_slot(allocator, sticky_key, selected_slot, slot_by_id)
 
