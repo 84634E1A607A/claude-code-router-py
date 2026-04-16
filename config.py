@@ -68,8 +68,8 @@ class DPRoutingConfig(BaseModel):
     @classmethod
     def _validate_sticky_mode(cls, value: str) -> str:
         value = value.strip()
-        if value not in ("session", "system", "session_system"):
-            raise ValueError("sticky_mode must be one of: session, system, session_system")
+        if value != "session_system":
+            raise ValueError("sticky_mode must be 'session_system'")
         return value
 
 

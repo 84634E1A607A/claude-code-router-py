@@ -119,7 +119,6 @@ python main.py [--config PATH]
       "dp_routing": {
         "enabled": true,
         "server_info_ttl_sec": 30,
-        "sticky_mode": "session_system",
         "session_ttl_sec": 10800.0
       },
       "params": {
@@ -176,16 +175,7 @@ python main.py [--config PATH]
 |---|---|---|---|
 | `enabled` | `bool` | required | 启用 DP 路由 |
 | `server_info_ttl_sec` | `int` | `30` | `/get_server_info` 缓存时间 |
-| `sticky_mode` | `string` | `session_system` | 粘性 key 选择方式 |
 | `session_ttl_sec` | `float` | `10800.0` | 会话保留时间 |
-
-`sticky_mode` 支持：
-
-| Value | Meaning |
-|---|---|
-| `session` | 基于 `X-Claude-Code-Session-Id` |
-| `system` | 基于标准化 system prompt |
-| `session_system` | 组合 session 和 system 特征 |
 
 ### Router
 

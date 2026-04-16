@@ -647,9 +647,6 @@ class TestConfig(unittest.TestCase):
     def test_resolve_route_no_router(self):
         self.assertIsNone(resolve_route({}))
 
-    def test_resolve_route_rejects_legacy_target(self):
-        self.assertIsNone(resolve_route({"Router": {"default": "p,m"}}))
-
     def test_get_provider_found(self):
         p = get_provider({"Providers": [{"name": "foo", "model": "m", "api_key": "k"}]}, "foo")
         self.assertEqual(p["api_key"], "k")
@@ -662,17 +659,6 @@ class TestConfig(unittest.TestCase):
             validate_config({
                 "Providers": [{"name": "foo", "api_base_url": "http://host/v1/chat/completions"}],
                 "Router": {"default": "/model"},
-            })
-
-    def test_validate_config_rejects_legacy_router_syntax(self):
-        with self.assertRaisesRegex(ValueError, "deprecated"):
-            validate_config({
-                "Providers": [{
-                    "name": "foo",
-                    "model": "/model",
-                    "api_base_url": "http://host/v1/chat/completions",
-                }],
-                "Router": {"default": "foo,/model"},
             })
 
     def test_validate_config_rejects_unknown_top_level_key(self):
@@ -710,7 +696,6 @@ class TestConfig(unittest.TestCase):
                 }],
                 "Router": {"default": "/model"},
             })
-
 
 class TestApplyProviderParams(unittest.TestCase):
 
@@ -930,30 +915,20 @@ class TestDPRoutingStickyKeys(unittest.TestCase):
         import zlib
         return f"{zlib.adler32(block['text'].encode('utf-8')) & 0xffff:04x}"
 
-    def test_derive_dp_sticky_key_uses_system_hash_even_without_explicit_mode(self):
+    def test_derive_sticky_key_uses_system_hash(self):
         import server as srv_mod
 
-        sticky_key, source, subagent_id = srv_mod._derive_dp_sticky_key("session-1", {}, {"system": "Prompt"})
-        self.assertTrue(sticky_key.startswith("session-1:"))
-        self.assertEqual(source, "session_system")
-        self.assertIsNone(subagent_id)
-
-    def test_derive_dp_sticky_key_uses_system_hash(self):
-        import server as srv_mod
-
-        provider = {"dp_routing": {"enabled": True, "sticky_mode": "session_system"}}
-        sticky_key, source, subagent_id = srv_mod._derive_dp_sticky_key("session-1", provider, {"system": "Agent prompt"})
+        sticky_key, source, subagent_id = srv_mod._derive_sticky_key("session-1", {"system": "Agent prompt"})
 
         self.assertTrue(sticky_key.startswith("session-1:"))
         self.assertEqual(source, "session_system")
         self.assertIsNone(subagent_id)
 
-    def test_derive_dp_sticky_key_normalizes_whitespace(self):
+    def test_derive_sticky_key_normalizes_whitespace(self):
         import server as srv_mod
 
-        provider = {"dp_routing": {"enabled": True, "sticky_mode": "session_system"}}
-        sticky_one, _, _ = srv_mod._derive_dp_sticky_key("session-1", provider, {"system": "Agent   prompt"})
-        sticky_two, _, _ = srv_mod._derive_dp_sticky_key("session-1", provider, {"system": "  Agent prompt\n"})
+        sticky_one, _, _ = srv_mod._derive_sticky_key("session-1", {"system": "Agent   prompt"})
+        sticky_two, _, _ = srv_mod._derive_sticky_key("session-1", {"system": "  Agent prompt\n"})
 
         self.assertEqual(sticky_one, sticky_two)
 
@@ -976,10 +951,9 @@ class TestDPRoutingStickyKeys(unittest.TestCase):
             block["text"],
         )
 
-    def test_derive_dp_sticky_key_prefers_subagent_hash_input(self):
+    def test_derive_sticky_key_prefers_subagent_hash_input(self):
         import server as srv_mod
 
-        provider = {"dp_routing": {"enabled": True, "sticky_mode": "session_system"}}
         block = {"type": "text", "text": "Exit immediately. Just respond with \"Exiting now\" and do nothing else."}
         req = {
             "system": "fallback system prompt",
@@ -992,7 +966,7 @@ class TestDPRoutingStickyKeys(unittest.TestCase):
             }],
         }
         expected_subagent_id = self._expected_subagent_id(block)
-        sticky_key, source, subagent_id = srv_mod._derive_dp_sticky_key("session-1", provider, req)
+        sticky_key, source, subagent_id = srv_mod._derive_sticky_key("session-1", req)
 
         self.assertEqual(sticky_key, f"session-1:{expected_subagent_id}")
         self.assertEqual(source, "session_system")
@@ -1702,7 +1676,7 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.headers["X-Router-DP-Rank"], str(expected_rank))
         self.assertIn("message_start", resp.text)
 
-    async def test_session_system_sticky_mode_separates_subagents(self):
+    async def test_sticky_routing_separates_subagents(self):
         sent_bodies = []
         self.srv.set_config({
             "API_TIMEOUT_MS": 60000,
@@ -1715,7 +1689,6 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
                 "dp_routing": {
                     "enabled": True,
                     "server_info_ttl_sec": 30,
-                    "sticky_mode": "session_system",
                 },
             }],
             "Router": {"default": "/model"},
