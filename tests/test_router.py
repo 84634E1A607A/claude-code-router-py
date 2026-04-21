@@ -1953,6 +1953,22 @@ class TestMetricsEndpoint(unittest.IsolatedAsyncioTestCase):
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
         }
 
+    def _family(self, data, name):
+        for family in data["families"]:
+            if family["name"] == name:
+                return family
+        self.fail(f"metric family not found: {name}")
+
+    def _sample_value(self, data, name, labels=None):
+        labels = labels or {}
+        for family in data["families"]:
+            for sample in family["samples"]:
+                if sample["name"] != name:
+                    continue
+                if sample["labels"] == labels:
+                    return sample["value"]
+        self.fail(f"metric sample not found: {name} labels={labels}")
+
     async def test_metrics_reports_active_requests_and_per_dp_active_requests(self):
         entered = asyncio.Event()
         release = asyncio.Event()
@@ -1978,18 +1994,22 @@ class TestMetricsEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(metrics_resp.status_code, 200, metrics_resp.text)
         data = metrics_resp.json()
-        self.assertEqual(data["totals"]["active_requests"], 1)
-        self.assertEqual(data["totals"]["active_input_tokens"], 17)
-        self.assertEqual(data["totals"]["active_output_tokens"], 0)
-        self.assertEqual(data["totals"]["completed_input_tokens"], 0)
-        self.assertEqual(data["totals"]["input_tokens"], 17)
-        provider = data["providers"][0]
-        self.assertEqual(provider["active_requests"], 1)
-        self.assertEqual(provider["active_input_tokens"], 17)
-        self.assertEqual(provider["completed_input_tokens"], 0)
-        self.assertEqual(provider["per_dp"][0]["rank"], 0)
-        self.assertEqual(provider["per_dp"][0]["active_requests"], 1)
-        self.assertEqual(provider["per_dp"][0]["active_input_tokens"], 17)
+        provider_labels = {
+            "provider_key": "sglang:http://host:8000/v1/chat/completions",
+            "provider_name": "sglang",
+        }
+        dp_labels = dict(provider_labels)
+        dp_labels["dp_rank"] = "0"
+        self.assertEqual(self._sample_value(data, "ccr_active_requests"), 1)
+        self.assertEqual(self._sample_value(data, "ccr_active_input_tokens"), 17)
+        self.assertEqual(self._sample_value(data, "ccr_active_output_tokens"), 0)
+        self.assertEqual(self._sample_value(data, "ccr_completed_input_tokens_total"), 0)
+        self.assertEqual(self._sample_value(data, "ccr_input_tokens_total"), 17)
+        self.assertEqual(self._sample_value(data, "ccr_provider_active_requests", provider_labels), 1)
+        self.assertEqual(self._sample_value(data, "ccr_provider_active_input_tokens", provider_labels), 17)
+        self.assertEqual(self._sample_value(data, "ccr_provider_completed_input_tokens_total", provider_labels), 0)
+        self.assertEqual(self._sample_value(data, "ccr_provider_dp_active_requests", dp_labels), 1)
+        self.assertEqual(self._sample_value(data, "ccr_provider_dp_active_input_tokens", dp_labels), 17)
 
     async def test_metrics_reports_completed_request_throughput_sessions_and_tokens(self):
         with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
@@ -2005,29 +2025,31 @@ class TestMetricsEndpoint(unittest.IsolatedAsyncioTestCase):
         metrics_resp = await self.client.get("/metrics")
         self.assertEqual(metrics_resp.status_code, 200, metrics_resp.text)
         data = metrics_resp.json()
-        self.assertEqual(data["totals"]["active_requests"], 0)
-        self.assertEqual(data["totals"]["requests_completed"], 1)
-        self.assertEqual(data["totals"]["input_tokens"], 10)
-        self.assertEqual(data["totals"]["output_tokens"], 5)
-        self.assertEqual(data["totals"]["active_input_tokens"], 0)
-        self.assertEqual(data["totals"]["active_output_tokens"], 0)
-        self.assertEqual(data["totals"]["completed_input_tokens"], 10)
-        self.assertEqual(data["totals"]["completed_output_tokens"], 5)
-        self.assertGreater(data["totals"]["throughput"]["total_tokens_per_sec"], 0.0)
-
-        provider = data["providers"][0]
-        self.assertEqual(provider["provider_name"], "sglang")
-        self.assertEqual(provider["dp_size"], 4)
-        self.assertEqual(provider["total_sessions"], 1)
-        self.assertEqual(provider["requests_completed"], 1)
-        self.assertEqual(provider["completed_input_tokens"], 10)
-        self.assertEqual(provider["active_input_tokens"], 0)
-        self.assertEqual(provider["per_dp"][0]["rank"], 0)
-        self.assertEqual(provider["per_dp"][0]["sessions"], 1)
-        self.assertEqual(provider["per_dp"][0]["requests_completed"], 1)
-        self.assertEqual(provider["per_dp"][0]["completed_input_tokens"], 10)
-        self.assertEqual(provider["per_dp"][0]["output_tokens"], 5)
-        self.assertGreater(provider["per_dp"][0]["throughput"]["output_tokens_per_sec"], 0.0)
+        provider_labels = {
+            "provider_key": "sglang:http://host:8000/v1/chat/completions",
+            "provider_name": "sglang",
+        }
+        dp_labels = dict(provider_labels)
+        dp_labels["dp_rank"] = "0"
+        self.assertEqual(self._sample_value(data, "ccr_active_requests"), 0)
+        self.assertEqual(self._sample_value(data, "ccr_requests_completed_total"), 1)
+        self.assertEqual(self._sample_value(data, "ccr_input_tokens_total"), 10)
+        self.assertEqual(self._sample_value(data, "ccr_output_tokens_total"), 5)
+        self.assertEqual(self._sample_value(data, "ccr_active_input_tokens"), 0)
+        self.assertEqual(self._sample_value(data, "ccr_active_output_tokens"), 0)
+        self.assertEqual(self._sample_value(data, "ccr_completed_input_tokens_total"), 10)
+        self.assertEqual(self._sample_value(data, "ccr_completed_output_tokens_total"), 5)
+        self.assertGreater(self._sample_value(data, "ccr_throughput_total_tokens_per_second"), 0.0)
+        self.assertEqual(self._sample_value(data, "ccr_provider_dp_size", provider_labels), 4)
+        self.assertEqual(self._sample_value(data, "ccr_provider_sessions", provider_labels), 1)
+        self.assertEqual(self._sample_value(data, "ccr_provider_requests_completed_total", provider_labels), 1)
+        self.assertEqual(self._sample_value(data, "ccr_provider_completed_input_tokens_total", provider_labels), 10)
+        self.assertEqual(self._sample_value(data, "ccr_provider_active_input_tokens", provider_labels), 0)
+        self.assertEqual(self._sample_value(data, "ccr_provider_dp_sessions", dp_labels), 1)
+        self.assertEqual(self._sample_value(data, "ccr_provider_dp_requests_completed_total", dp_labels), 1)
+        self.assertEqual(self._sample_value(data, "ccr_provider_dp_completed_input_tokens_total", dp_labels), 10)
+        self.assertEqual(self._sample_value(data, "ccr_provider_dp_output_tokens_total", dp_labels), 5)
+        self.assertGreater(self._sample_value(data, "ccr_provider_dp_throughput_output_tokens_per_second", dp_labels), 0.0)
 
     async def test_metrics_tracks_streaming_requests(self):
         class FakeProviderStream:
@@ -2069,15 +2091,20 @@ class TestMetricsEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         metrics_resp = await self.client.get("/metrics")
         data = metrics_resp.json()
-        self.assertEqual(data["totals"]["streaming_requests_started"], 1)
-        self.assertEqual(data["totals"]["requests_completed"], 1)
-        self.assertEqual(data["totals"]["completed_input_tokens"], 12)
-        self.assertEqual(data["totals"]["completed_output_tokens"], 3)
-        provider = data["providers"][0]
-        self.assertEqual(provider["streaming_requests_started"], 1)
-        self.assertEqual(provider["per_dp"][0]["requests_completed"], 1)
-        self.assertEqual(provider["per_dp"][0]["input_tokens"], 12)
-        self.assertEqual(provider["per_dp"][0]["output_tokens"], 3)
+        provider_labels = {
+            "provider_key": "sglang:http://host:8000/v1/chat/completions",
+            "provider_name": "sglang",
+        }
+        dp_labels = dict(provider_labels)
+        dp_labels["dp_rank"] = "0"
+        self.assertEqual(self._sample_value(data, "ccr_streaming_requests_started_total"), 1)
+        self.assertEqual(self._sample_value(data, "ccr_requests_completed_total"), 1)
+        self.assertEqual(self._sample_value(data, "ccr_completed_input_tokens_total"), 12)
+        self.assertEqual(self._sample_value(data, "ccr_completed_output_tokens_total"), 3)
+        self.assertEqual(self._sample_value(data, "ccr_provider_streaming_requests_started_total", provider_labels), 1)
+        self.assertEqual(self._sample_value(data, "ccr_provider_dp_requests_completed_total", dp_labels), 1)
+        self.assertEqual(self._sample_value(data, "ccr_provider_dp_input_tokens_total", dp_labels), 12)
+        self.assertEqual(self._sample_value(data, "ccr_provider_dp_output_tokens_total", dp_labels), 3)
 
     async def test_metrics_estimates_streaming_output_tokens_while_active(self):
         entered = asyncio.Event()
@@ -2133,6 +2160,59 @@ class TestMetricsEndpoint(unittest.IsolatedAsyncioTestCase):
         provider_snapshot = data["providers"][provider_key]
         self.assertGreater(provider_snapshot["active_output_tokens"], 0)
         self.assertGreater(provider_snapshot["per_dp"][0]["active_output_tokens"], 0)
+
+    async def test_metric_prom_exports_prometheus_text(self):
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
+             patch.object(self.srv, "_count_request_input_tokens", new=AsyncMock(return_value=(17, "/models/tokenizer"))), \
+             patch.object(self.srv, "post_json", new=AsyncMock(return_value=self._openai_resp(completion_tokens=5))):
+            response = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._CLAUDE_SESSION_HEADER: "metrics-session"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        prom_resp = await self.client.get("/metric_prom")
+        self.assertEqual(prom_resp.status_code, 200, prom_resp.text)
+        self.assertIn("text/plain", prom_resp.headers.get("content-type", ""))
+        body = prom_resp.text
+        self.assertIn("# HELP ccr_up Router health status.", body)
+        self.assertIn("ccr_up 1", body)
+        self.assertIn('ccr_provider_requests_completed_total{provider_key="sglang:http://host:8000/v1/chat/completions",provider_name="sglang"} 1.0', body)
+        self.assertIn('ccr_provider_dp_sessions{dp_rank="0",provider_key="sglang:http://host:8000/v1/chat/completions",provider_name="sglang"} 1.0', body)
+
+    async def test_sglang_metrics_proxies_metrics_with_metric_fallback(self):
+        class FakeClient:
+            def __init__(self, responses):
+                self.responses = list(responses)
+                self.calls = []
+
+            async def get(self, url, headers=None, timeout=None, **kwargs):
+                self.calls.append((url, headers, timeout, kwargs))
+                return self.responses.pop(0)
+
+        first = httpx.Response(
+            404,
+            text="missing",
+            headers={"content-type": "text/plain; charset=utf-8"},
+            request=httpx.Request("GET", "http://host:8000/metrics"),
+        )
+        second = httpx.Response(
+            200,
+            text="# HELP sglang:prompt_tokens_total Number of prefill tokens processed.\n",
+            headers={"content-type": "text/plain; version=0.0.4; charset=utf-8"},
+            request=httpx.Request("GET", "http://host:8000/metric"),
+        )
+        fake_client = FakeClient([first, second])
+
+        with patch.object(self.srv, "get_shared_client", return_value=fake_client):
+            response = await self.client.get("/sglang/sglang_metrics")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("text/plain", response.headers.get("content-type", ""))
+        self.assertIn("sglang:prompt_tokens_total", response.text)
+        self.assertEqual(fake_client.calls[0][0], "http://host:8000/metrics")
+        self.assertEqual(fake_client.calls[1][0], "http://host:8000/metric")
 
 
 # ============================================================================

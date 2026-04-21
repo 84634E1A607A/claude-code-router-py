@@ -23,6 +23,7 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Counter, Gauge, generate_latest
 
 from batch import anthropic_batch_to_openai_jsonl, openai_batch_to_anthropic, openai_results_line_to_anthropic
 from client import (
@@ -1092,6 +1093,17 @@ def _batches_url(provider: dict) -> str:
 
 def _files_url(provider: dict) -> str:
     return _api_base(provider) + "/files"
+
+
+def _sglang_root_url(provider: dict) -> str:
+    api_base = _api_base(provider).rstrip("/")
+    return api_base.removesuffix("/v1").removesuffix("/")
+
+
+def _sglang_metrics_urls(provider: dict) -> list[str]:
+    root = _sglang_root_url(provider)
+    urls = [f"{root}/metrics", f"{root}/metric"]
+    return list(dict.fromkeys(urls))
 
 
 def _dp_routing_config(provider: dict) -> dict | None:
@@ -2256,8 +2268,7 @@ async def batch_results(batch_id: str, request: Request):
 # Metrics + Health check
 # ---------------------------------------------------------------------------
 
-@app.get("/metrics")
-async def metrics():
+def _build_metrics_payload() -> dict[str, Any]:
     snapshot = _runtime_metrics.snapshot()
     providers: list[dict] = []
     configured_providers = {
@@ -2399,6 +2410,322 @@ async def metrics():
         },
         "providers": providers,
     }
+
+
+def _build_metric_prom_registry(data: dict[str, Any]) -> CollectorRegistry:
+    registry = CollectorRegistry()
+    totals = data["totals"]
+
+    def add_gauge(name: str, help_text: str, value: Any) -> None:
+        Gauge(name, help_text, registry=registry).set(value)
+
+    def add_counter(name: str, help_text: str, value: Any) -> None:
+        Counter(name, help_text, registry=registry)._value.set(value)
+
+    def add_labeled_gauge(
+        name: str,
+        help_text: str,
+        label_names: list[str],
+        samples: list[tuple[dict[str, Any], Any]],
+    ) -> None:
+        metric = Gauge(name, help_text, label_names, registry=registry)
+        for labels, value in samples:
+            metric.labels(**{label: str(labels[label]) for label in label_names}).set(value)
+
+    def add_labeled_counter(
+        name: str,
+        help_text: str,
+        label_names: list[str],
+        samples: list[tuple[dict[str, Any], Any]],
+    ) -> None:
+        metric = Counter(name, help_text, label_names, registry=registry)
+        for labels, value in samples:
+            metric.labels(**{label: str(labels[label]) for label in label_names})._value.set(value)
+
+    def resolve_metric_value(item: dict[str, Any], field: str) -> Any:
+        value: Any = item
+        for part in field.split("."):
+            if not isinstance(value, dict):
+                return None
+            value = value.get(part)
+        return value
+
+    add_gauge("ccr_up", "Router health status.", 1)
+    add_gauge("ccr_process_pid", "Current router process id.", os.getpid())
+    add_gauge("ccr_uptime_seconds", "Router uptime in seconds.", data["uptime_sec"])
+    add_gauge(
+        "ccr_throughput_window_seconds",
+        "Throughput lookback window in seconds.",
+        data["throughput_window_sec"],
+    )
+
+    total_gauges = {
+        "ccr_active_requests": ("Current active requests.", totals["active_requests"]),
+        "ccr_active_input_tokens": ("Current active input tokens.", totals["active_input_tokens"]),
+        "ccr_active_output_tokens": ("Current active output tokens.", totals["active_output_tokens"]),
+        "ccr_active_total_tokens": ("Current active total tokens.", totals["active_total_tokens"]),
+        "ccr_avg_latency_seconds": ("Average request latency in seconds.", totals["avg_latency_sec"]),
+        "ccr_throughput_requests_in_window": (
+            "Completed requests counted inside the throughput window.",
+            totals["throughput"]["requests_in_window"],
+        ),
+        "ccr_throughput_total_tokens_per_second": (
+            "Total token throughput inside the throughput window.",
+            totals["throughput"]["total_tokens_per_sec"],
+        ),
+        "ccr_throughput_output_tokens_per_second": (
+            "Output token throughput inside the throughput window.",
+            totals["throughput"]["output_tokens_per_sec"],
+        ),
+    }
+    for metric_name, (help_text, value) in total_gauges.items():
+        add_gauge(metric_name, help_text, value)
+
+    total_counters = {
+        "ccr_requests_started_total": ("Total requests started.", totals["requests_started"]),
+        "ccr_requests_completed_total": ("Total requests completed.", totals["requests_completed"]),
+        "ccr_requests_failed_total": ("Total requests failed.", totals["requests_failed"]),
+        "ccr_streaming_requests_started_total": (
+            "Total streaming requests started.",
+            totals["streaming_requests_started"],
+        ),
+        "ccr_non_streaming_requests_started_total": (
+            "Total non-streaming requests started.",
+            totals["non_streaming_requests_started"],
+        ),
+        "ccr_completed_input_tokens_total": (
+            "Total completed input tokens.",
+            totals["completed_input_tokens"],
+        ),
+        "ccr_completed_output_tokens_total": (
+            "Total completed output tokens.",
+            totals["completed_output_tokens"],
+        ),
+        "ccr_completed_total_tokens_total": (
+            "Total completed tokens.",
+            totals["completed_total_tokens"],
+        ),
+        "ccr_input_tokens_total": ("Total input tokens including active requests.", totals["input_tokens"]),
+        "ccr_output_tokens_total": ("Total output tokens including active requests.", totals["output_tokens"]),
+        "ccr_total_tokens_total": ("Total tokens including active requests.", totals["total_tokens"]),
+    }
+    for metric_name, (help_text, value) in total_counters.items():
+        add_counter(metric_name, help_text, value)
+
+    provider_gauge_defs: list[tuple[str, str, str]] = [
+        ("ccr_provider_dp_routing_enabled", "Whether DP routing is enabled for the provider.", "dp_routing_enabled"),
+        ("ccr_provider_dp_size", "Configured or observed DP size for the provider.", "dp_size"),
+        ("ccr_provider_sessions", "Current sticky sessions assigned to the provider.", "total_sessions"),
+        ("ccr_provider_active_requests", "Current active requests for the provider.", "active_requests"),
+        ("ccr_provider_active_input_tokens", "Current active input tokens for the provider.", "active_input_tokens"),
+        ("ccr_provider_active_output_tokens", "Current active output tokens for the provider.", "active_output_tokens"),
+        ("ccr_provider_active_total_tokens", "Current active total tokens for the provider.", "active_total_tokens"),
+        ("ccr_provider_avg_latency_seconds", "Average request latency for the provider.", "avg_latency_sec"),
+        ("ccr_provider_throughput_requests_in_window", "Provider requests counted inside the throughput window.", "throughput.requests_in_window"),
+        ("ccr_provider_throughput_total_tokens_per_second", "Provider total token throughput inside the throughput window.", "throughput.total_tokens_per_sec"),
+        ("ccr_provider_throughput_output_tokens_per_second", "Provider output token throughput inside the throughput window.", "throughput.output_tokens_per_sec"),
+    ]
+    provider_counter_defs: list[tuple[str, str, str]] = [
+        ("ccr_provider_requests_started_total", "Total requests started for the provider.", "requests_started"),
+        ("ccr_provider_requests_completed_total", "Total requests completed for the provider.", "requests_completed"),
+        ("ccr_provider_requests_failed_total", "Total requests failed for the provider.", "requests_failed"),
+        ("ccr_provider_streaming_requests_started_total", "Total streaming requests started for the provider.", "streaming_requests_started"),
+        ("ccr_provider_non_streaming_requests_started_total", "Total non-streaming requests started for the provider.", "non_streaming_requests_started"),
+        ("ccr_provider_completed_input_tokens_total", "Total completed input tokens for the provider.", "completed_input_tokens"),
+        ("ccr_provider_completed_output_tokens_total", "Total completed output tokens for the provider.", "completed_output_tokens"),
+        ("ccr_provider_completed_total_tokens_total", "Total completed tokens for the provider.", "completed_total_tokens"),
+        ("ccr_provider_input_tokens_total", "Total input tokens for the provider including active requests.", "input_tokens"),
+        ("ccr_provider_output_tokens_total", "Total output tokens for the provider including active requests.", "output_tokens"),
+        ("ccr_provider_total_tokens_total", "Total tokens for the provider including active requests.", "total_tokens"),
+    ]
+    provider_label_names = ["provider_key", "provider_name"]
+    provider_info_samples: list[tuple[dict[str, Any], Any]] = []
+    for provider in data["providers"]:
+        info_labels = {
+            "provider_key": provider["provider_key"],
+            "provider_name": provider["provider_name"],
+            "api_base_url": provider.get("api_base_url") or "",
+        }
+        provider_info_samples.append((info_labels, 1))
+    add_labeled_gauge(
+        "ccr_provider_info",
+        "Provider metadata.",
+        ["provider_key", "provider_name", "api_base_url"],
+        provider_info_samples,
+    )
+
+    for metric_name, help_text, field_name in provider_gauge_defs:
+        samples: list[tuple[dict[str, Any], Any]] = []
+        for provider in data["providers"]:
+            value = resolve_metric_value(provider, field_name)
+            if value is None:
+                continue
+            samples.append(({
+                "provider_key": provider["provider_key"],
+                "provider_name": provider["provider_name"],
+            }, value))
+        add_labeled_gauge(metric_name, help_text, provider_label_names, samples)
+
+    for metric_name, help_text, field_name in provider_counter_defs:
+        samples: list[tuple[dict[str, Any], Any]] = []
+        for provider in data["providers"]:
+            value = resolve_metric_value(provider, field_name)
+            if value is None:
+                continue
+            samples.append(({
+                "provider_key": provider["provider_key"],
+                "provider_name": provider["provider_name"],
+            }, value))
+        add_labeled_counter(metric_name, help_text, provider_label_names, samples)
+
+    per_dp_gauge_defs: list[tuple[str, str, str]] = [
+        ("ccr_provider_dp_sessions", "Current sticky sessions assigned to the provider DP rank.", "sessions"),
+        ("ccr_provider_dp_active_requests", "Current active requests for the provider DP rank.", "active_requests"),
+        ("ccr_provider_dp_active_input_tokens", "Current active input tokens for the provider DP rank.", "active_input_tokens"),
+        ("ccr_provider_dp_active_output_tokens", "Current active output tokens for the provider DP rank.", "active_output_tokens"),
+        ("ccr_provider_dp_active_total_tokens", "Current active total tokens for the provider DP rank.", "active_total_tokens"),
+        ("ccr_provider_dp_avg_latency_seconds", "Average request latency for the provider DP rank.", "avg_latency_sec"),
+        ("ccr_provider_dp_throughput_requests_in_window", "Provider DP-rank requests counted inside the throughput window.", "throughput.requests_in_window"),
+        ("ccr_provider_dp_throughput_total_tokens_per_second", "Provider DP-rank total token throughput inside the throughput window.", "throughput.total_tokens_per_sec"),
+        ("ccr_provider_dp_throughput_output_tokens_per_second", "Provider DP-rank output token throughput inside the throughput window.", "throughput.output_tokens_per_sec"),
+    ]
+    per_dp_counter_defs: list[tuple[str, str, str]] = [
+        ("ccr_provider_dp_requests_started_total", "Total requests started for the provider DP rank.", "requests_started"),
+        ("ccr_provider_dp_requests_completed_total", "Total requests completed for the provider DP rank.", "requests_completed"),
+        ("ccr_provider_dp_requests_failed_total", "Total requests failed for the provider DP rank.", "requests_failed"),
+        ("ccr_provider_dp_streaming_requests_started_total", "Total streaming requests started for the provider DP rank.", "streaming_requests_started"),
+        ("ccr_provider_dp_non_streaming_requests_started_total", "Total non-streaming requests started for the provider DP rank.", "non_streaming_requests_started"),
+        ("ccr_provider_dp_completed_input_tokens_total", "Total completed input tokens for the provider DP rank.", "completed_input_tokens"),
+        ("ccr_provider_dp_completed_output_tokens_total", "Total completed output tokens for the provider DP rank.", "completed_output_tokens"),
+        ("ccr_provider_dp_completed_total_tokens_total", "Total completed tokens for the provider DP rank.", "completed_total_tokens"),
+        ("ccr_provider_dp_input_tokens_total", "Total input tokens for the provider DP rank including active requests.", "input_tokens"),
+        ("ccr_provider_dp_output_tokens_total", "Total output tokens for the provider DP rank including active requests.", "output_tokens"),
+        ("ccr_provider_dp_total_tokens_total", "Total tokens for the provider DP rank including active requests.", "total_tokens"),
+    ]
+    per_dp_label_names = ["provider_key", "provider_name", "dp_rank"]
+    for metric_name, help_text, field_name in per_dp_gauge_defs:
+        samples: list[tuple[dict[str, Any], Any]] = []
+        for provider in data["providers"]:
+            for rank_data in provider["per_dp"]:
+                value = resolve_metric_value(rank_data, field_name)
+                if value is None:
+                    continue
+                samples.append(({
+                    "provider_key": provider["provider_key"],
+                    "provider_name": provider["provider_name"],
+                    "dp_rank": rank_data["rank"],
+                }, value))
+        add_labeled_gauge(metric_name, help_text, per_dp_label_names, samples)
+
+    for metric_name, help_text, field_name in per_dp_counter_defs:
+        samples: list[tuple[dict[str, Any], Any]] = []
+        for provider in data["providers"]:
+            for rank_data in provider["per_dp"]:
+                value = resolve_metric_value(rank_data, field_name)
+                if value is None:
+                    continue
+                samples.append(({
+                    "provider_key": provider["provider_key"],
+                    "provider_name": provider["provider_name"],
+                    "dp_rank": rank_data["rank"],
+                }, value))
+        add_labeled_counter(metric_name, help_text, per_dp_label_names, samples)
+
+    return registry
+
+
+def _metric_sample_to_json(sample: Any) -> dict[str, Any]:
+    item = {
+        "name": sample.name,
+        "labels": dict(sample.labels),
+        "value": sample.value,
+    }
+    if sample.timestamp is not None:
+        item["timestamp"] = sample.timestamp
+    if sample.exemplar is not None:
+        item["exemplar"] = {
+            "labels": dict(sample.exemplar.labels),
+            "value": sample.exemplar.value,
+            "timestamp": sample.exemplar.timestamp,
+        }
+    return item
+
+
+def _registry_to_json(registry: CollectorRegistry) -> dict[str, Any]:
+    families: list[dict[str, Any]] = []
+    for metric in registry.collect():
+        samples = [
+            _metric_sample_to_json(sample)
+            for sample in metric.samples
+            if not sample.name.endswith("_created")
+        ]
+        families.append({
+            "name": metric.name,
+            "type": metric.type,
+            "documentation": metric.documentation,
+            "samples": samples,
+        })
+    return {
+        "status": "ok",
+        "families": families,
+    }
+
+
+@app.get("/metrics")
+async def metrics():
+    registry = _build_metric_prom_registry(_build_metrics_payload())
+    return _registry_to_json(registry)
+
+
+@app.get("/metric_prom")
+async def metric_prom():
+    registry = _build_metric_prom_registry(_build_metrics_payload())
+    return Response(
+        content=generate_latest(registry),
+        headers={"Content-Type": CONTENT_TYPE_LATEST},
+    )
+
+
+@app.get("/{provider_name}/sglang_metrics")
+async def sglang_metrics(provider_name: str):
+    provider = get_provider(_config, provider_name)
+    if provider is None:
+        raise HTTPException(404, f"Unknown provider '{provider_name}'")
+
+    timeout = _timeout()
+    client = get_shared_client()
+    last_response: httpx.Response | None = None
+    try:
+        for index, url in enumerate(_sglang_metrics_urls(provider)):
+            response = await client.get(
+                url,
+                headers=_provider_headers(provider),
+                timeout=upstream_timeout(timeout),
+            )
+            last_response = response
+            if response.status_code == 404 and index == 0:
+                continue
+            content_type = response.headers.get("content-type", "text/plain; version=0.0.4; charset=utf-8")
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers={"Content-Type": content_type},
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("SGLang metrics proxy error for provider %s", provider_name)
+        raise HTTPException(502, f"Upstream SGLang metrics request failed: {exc}")
+
+    if last_response is None:
+        raise HTTPException(502, "Upstream SGLang metrics request failed: no response")
+
+    content_type = last_response.headers.get("content-type", "text/plain; version=0.0.4; charset=utf-8")
+    return Response(
+        content=last_response.content,
+        status_code=last_response.status_code,
+        headers={"Content-Type": content_type},
+    )
 
 
 @app.get("/health")
