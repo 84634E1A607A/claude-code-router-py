@@ -1344,6 +1344,35 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
             req.update(extra)
         return req
 
+    def _compact_messages_req(self):
+        return self._messages_req({
+            "messages": [{
+                "role": "user",
+                "content": (
+                    "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n"
+                    "Your entire response must be plain text: an <analysis> block followed by a <summary> block.\n"
+                    "1. Primary Request and Intent:\n"
+                    "7. Pending Tasks:\n"
+                    "Wrap the result in <analysis> and <summary>."
+                ),
+            }],
+        })
+
+    def _subagent_messages_req(self):
+        return self._messages_req({
+            "system": [
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+                {"type": "text", "text": "You are an agent for Claude Code, Anthropic's official CLI for Claude."},
+            ],
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<system-reminder>\n# currentDate\nToday's date is 2026/04/22.\n</system-reminder>"},
+                    {"type": "text", "text": "Exit directly. Do nothing else."},
+                ],
+            }],
+        })
+
     def _openai_resp(self, text="PONG"):
         return {
             "id": "chatcmpl-test",
@@ -1378,6 +1407,78 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent_bodies[0]["routed_dp_rank"], expected_rank)
         self.assertEqual(resp.headers["X-Router-DP-Rank"], str(expected_rank))
         self.assertEqual(resp.headers["X-Router-Sticky-Key"], session_id)
+
+    async def test_messages_map_explicit_priority_header_to_openai_body(self):
+        sent_requests = []
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_requests.append((dict(headers), dict(body)))
+            return self._openai_resp()
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._REQUEST_PRIORITY_HEADER: "37"},
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(sent_requests[0][1]["priority"], 37)
+        self.assertNotIn(self.srv._REQUEST_PRIORITY_HEADER, sent_requests[0][0])
+
+    async def test_messages_invalid_priority_header_falls_back_to_main_priority(self):
+        sent_requests = []
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_requests.append((dict(headers), dict(body)))
+            return self._openai_resp()
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._REQUEST_PRIORITY_HEADER: "not-an-int"},
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(sent_requests[0][1]["priority"], self.srv._MAIN_REQUEST_PRIORITY)
+        self.assertNotIn(self.srv._REQUEST_PRIORITY_HEADER, sent_requests[0][0])
+
+    async def test_messages_infer_subagent_priority(self):
+        sent_bodies = []
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_bodies.append(dict(body))
+            return self._openai_resp()
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._subagent_messages_req(),
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(sent_bodies[0]["priority"], self.srv._SUBAGENT_REQUEST_PRIORITY)
+
+    async def test_messages_infer_compact_priority(self):
+        sent_bodies = []
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_bodies.append(dict(body))
+            return self._openai_resp()
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._compact_messages_req(),
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(sent_bodies[0]["priority"], self.srv._COMPACT_REQUEST_PRIORITY)
 
     async def test_messages_prefer_lower_active_requests_even_if_newer(self):
         sent_bodies = []
@@ -1626,7 +1727,7 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.headers["X-Router-DP-Rank"], "0")
 
     async def test_streaming_messages_inject_rank_and_headers(self):
-        sent_bodies = []
+        sent_requests = []
 
         class FakeProviderStream:
             def __init__(self, lines):
@@ -1653,7 +1754,7 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         ]
 
         async def fake_open_stream(url, headers, body, timeout=600.0, max_retries=3):
-            sent_bodies.append(dict(body))
+            sent_requests.append((dict(headers), dict(body)))
             return FakeProviderStream(stream_lines)
 
         session_id = "stream-session"
@@ -1672,7 +1773,9 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertEqual(sent_bodies[0]["routed_dp_rank"], expected_rank)
+        self.assertEqual(sent_requests[0][1]["routed_dp_rank"], expected_rank)
+        self.assertEqual(sent_requests[0][1]["priority"], self.srv._MAIN_REQUEST_PRIORITY)
+        self.assertNotIn(self.srv._REQUEST_PRIORITY_HEADER, sent_requests[0][0])
         self.assertEqual(resp.headers["X-Router-DP-Rank"], str(expected_rank))
         self.assertIn("message_start", resp.text)
 
@@ -1848,8 +1951,10 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sent_bodies), 2)
         # First request had rank 3 (invalid for dp_size=2)
         self.assertEqual(sent_bodies[0]["routed_dp_rank"], 3)
+        self.assertEqual(sent_bodies[0]["priority"], self.srv._MAIN_REQUEST_PRIORITY)
         # Second request got rank 0 (first available in new allocator with dp_size=2)
         self.assertEqual(sent_bodies[1]["routed_dp_rank"], 0)
+        self.assertEqual(sent_bodies[1]["priority"], self.srv._MAIN_REQUEST_PRIORITY)
         self.assertEqual(resp.headers["X-Router-DP-Rank"], "0")
 
     async def test_override_invalid_after_refresh_returns_400_without_remap(self):

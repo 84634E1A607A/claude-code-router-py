@@ -57,10 +57,23 @@ _config_signature: tuple[int, int] | None = None
 
 _CLAUDE_SESSION_HEADER = "X-Claude-Code-Session-Id"
 _DP_OVERRIDE_HEADER = "X-Routed-DP-Rank"
+_REQUEST_PRIORITY_HEADER = "X-Request-Priority"
 _DP_SERVER_INFO_TTL_SEC = 30
 _INVALID_DP_RANK_RE = re.compile(r"routed_dp_rank.*out of range", re.IGNORECASE | re.DOTALL)
 _WHITESPACE_RE = re.compile(r"\s+")
 _CONFIG_RELOAD_INTERVAL_SEC = 1.0
+_MAIN_REQUEST_PRIORITY = 20
+_SUBAGENT_REQUEST_PRIORITY = 10
+_COMPACT_REQUEST_PRIORITY = 0
+_INTERACTIVE_AGENT_MARKER = "You are an interactive agent that helps users with software engineering tasks."
+_SUBAGENT_SYSTEM_MARKER = "You are an agent for Claude Code, Anthropic's official CLI for Claude."
+_COMPACT_REQUEST_MARKERS = (
+    "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.",
+    "<analysis>",
+    "<summary>",
+    "Primary Request and Intent:",
+    "Pending Tasks:",
+)
 
 
 @dataclass
@@ -725,6 +738,79 @@ def _extract_subagent_hash_input(req: dict) -> str | None:
         return None
 
     return text
+
+
+def _extract_last_user_text(req: dict) -> str:
+    """Extract the last user text payload as a single string."""
+    messages = req.get("messages")
+    if not isinstance(messages, list):
+        return ""
+
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "\n".join(parts)
+        return ""
+
+    return ""
+
+
+def _is_compact_request(req: dict) -> bool:
+    """Identify Claude Code compaction requests from their summary prompt shape."""
+    last_user_text = _extract_last_user_text(req)
+    if not last_user_text:
+        return False
+    return all(marker in last_user_text for marker in _COMPACT_REQUEST_MARKERS)
+
+
+def _extract_system_texts(req: dict) -> list[str]:
+    system = req.get("system")
+    if isinstance(system, str):
+        return [system]
+    if isinstance(system, list):
+        texts: list[str] = []
+        for block in system:
+            if isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    texts.append(text)
+        return texts
+    return []
+
+
+def _is_subagent_request(req: dict) -> bool:
+    """Identify Claude Code subagent requests from their dedicated system prompt."""
+    system_text = "\n".join(_extract_system_texts(req))
+    if _SUBAGENT_SYSTEM_MARKER not in system_text:
+        return False
+    return _INTERACTIVE_AGENT_MARKER not in system_text
+
+
+def _resolve_request_priority(request: Request, anthropic_req: dict) -> int:
+    """Resolve SGLang request priority from an explicit header or Claude Code request shape."""
+    request_priority = request.headers.get(_REQUEST_PRIORITY_HEADER)
+    if request_priority is not None:
+        try:
+            return int(request_priority.strip())
+        except ValueError:
+            logger.info("Ignoring invalid %s=%r", _REQUEST_PRIORITY_HEADER, request_priority)
+
+    if _is_compact_request(anthropic_req):
+        return _COMPACT_REQUEST_PRIORITY
+    if _is_subagent_request(anthropic_req):
+        return _SUBAGENT_REQUEST_PRIORITY
+    return _MAIN_REQUEST_PRIORITY
 
 
 def _derive_sticky_key(session_id: str, anthropic_req: dict) -> tuple[str, str, str | None]:
@@ -1570,12 +1656,14 @@ async def messages(request: Request):
     # Override model in the original request so converter uses the routed model
     body = dict(body)
     body["model"] = model
+    request_priority = _resolve_request_priority(request, body)
 
     # Anthropic → OpenAI, then apply provider param defaults
     base_openai_req = anthropic_to_openai(body)
     selected_slot, openai_req, dp_decision = await _resolve_dp_routing(request, model, body, base_openai_req)
     provider = selected_slot.provider
     url = provider["api_base_url"]
+    openai_req["priority"] = request_priority
     openai_req = apply_provider_params(provider, openai_req)
     _log_dp_routing(provider, dp_decision)
     log_openai_request(openai_req)
@@ -1615,6 +1703,7 @@ async def messages(request: Request):
                 )
                 provider = selected_slot.provider
                 url = provider["api_base_url"]
+                openai_req["priority"] = request_priority
                 headers = _provider_headers(provider)
                 metrics_ctx.tokenizer_path = _resolve_tokenizer_path(provider)
                 try:
@@ -1662,6 +1751,7 @@ async def messages(request: Request):
             )
             provider = selected_slot.provider
             url = provider["api_base_url"]
+            openai_req["priority"] = request_priority
             headers = _provider_headers(provider)
             metrics_ctx.tokenizer_path = _resolve_tokenizer_path(provider)
             try:
