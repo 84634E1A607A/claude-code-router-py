@@ -2211,61 +2211,6 @@ class TestMetricsEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._sample_value(data, "ccr_provider_dp_input_tokens_total", dp_labels), 12)
         self.assertEqual(self._sample_value(data, "ccr_provider_dp_output_tokens_total", dp_labels), 3)
 
-    async def test_metrics_estimates_streaming_output_tokens_while_active(self):
-        entered = asyncio.Event()
-        release = asyncio.Event()
-
-        class FakeTokenizer:
-            def encode(self, text):
-                return list(text)
-
-        class FakeProviderStream:
-            async def __aiter__(self):
-                entered.set()
-                yield ("data: " + json.dumps({
-                    "id": "x",
-                    "choices": [{"index": 0, "delta": {"content": "PONG"}, "finish_reason": None}],
-                })).encode()
-                await release.wait()
-                yield ("data: " + json.dumps({
-                    "id": "x",
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                    "usage": {"prompt_tokens": 12, "completion_tokens": 3},
-                })).encode()
-                yield b"data: [DONE]"
-
-            async def aclose(self):
-                return None
-
-        provider = self.srv._config["Providers"][0]
-        provider_key = self.srv._dp_cache_key(provider)
-        metrics_ctx = self.srv._runtime_metrics.start_request(
-            provider_key=provider_key,
-            provider_name=provider["name"],
-            dp_rank=0,
-            is_stream=True,
-            input_tokens=17,
-            tokenizer_path="/models/tokenizer",
-        )
-
-        with patch.object(self.srv, "_get_tokenizer", return_value=FakeTokenizer()):
-            agen = self.srv._stream_response({}, FakeProviderStream(), "default", metrics_ctx=metrics_ctx)
-            for _ in range(4):
-                await agen.__anext__()
-            await entered.wait()
-            data = self.srv._runtime_metrics.snapshot()
-            release.set()
-            await agen.aclose()
-
-        self.assertEqual(data["active_requests"], 1)
-        self.assertEqual(data["active_input_tokens"], 17)
-        self.assertGreater(data["active_output_tokens"], 0)
-        self.assertEqual(data["completed_output_tokens"], 0)
-        self.assertGreater(data["output_tokens"], 0)
-        provider_snapshot = data["providers"][provider_key]
-        self.assertGreater(provider_snapshot["active_output_tokens"], 0)
-        self.assertGreater(provider_snapshot["per_dp"][0]["active_output_tokens"], 0)
-
     async def test_metric_prom_exports_prometheus_text(self):
         with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
              patch.object(self.srv, "_count_request_input_tokens", new=AsyncMock(return_value=(17, "/models/tokenizer"))), \

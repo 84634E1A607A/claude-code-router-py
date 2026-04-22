@@ -264,8 +264,6 @@ class RequestMetricsContext:
     dp_rank: int | None
     started_at: float
     is_stream: bool
-    input_tokens: int = 0
-    tokenizer_path: str | None = None
 
 
 class RuntimeMetrics:
@@ -338,7 +336,6 @@ class RuntimeMetrics:
         is_stream: bool,
         *,
         input_tokens: int = 0,
-        tokenizer_path: str | None = None,
     ) -> RequestMetricsContext:
         started_at = time.monotonic()
         request_id = uuid.uuid4().hex
@@ -382,8 +379,6 @@ class RuntimeMetrics:
             dp_rank=dp_rank,
             started_at=started_at,
             is_stream=is_stream,
-            input_tokens=int(input_tokens),
-            tokenizer_path=tokenizer_path,
         )
 
     def update_request_route(
@@ -446,17 +441,6 @@ class RuntimeMetrics:
         ctx.provider_key = provider_key
         ctx.provider_name = provider_name
         ctx.dp_rank = dp_rank
-
-    def update_request_output_tokens(
-        self,
-        ctx: RequestMetricsContext,
-        output_tokens: int,
-    ) -> None:
-        with self._lock:
-            active = self._active_request_tokens.get(ctx.request_id)
-            if active is None:
-                return
-            active["output_tokens"] = max(int(output_tokens), 0)
 
     def finish_request(
         self,
@@ -1671,7 +1655,6 @@ async def messages(request: Request):
     headers = _provider_headers(provider)
     max_retries: int = provider.get("max_retries", 3)
     timeout = _timeout()
-    tokenizer_path = _resolve_tokenizer_path(provider)
     try:
         input_tokens, _ = await _count_request_input_tokens(provider, model, openai_req)
     except Exception:
@@ -1685,7 +1668,6 @@ async def messages(request: Request):
         dp_rank=dp_decision.provider_dp_rank,
         is_stream=is_stream,
         input_tokens=input_tokens,
-        tokenizer_path=tokenizer_path,
     )
 
     if is_stream:
@@ -1705,7 +1687,6 @@ async def messages(request: Request):
                 url = provider["api_base_url"]
                 openai_req["priority"] = request_priority
                 headers = _provider_headers(provider)
-                metrics_ctx.tokenizer_path = _resolve_tokenizer_path(provider)
                 try:
                     stream = await open_provider_stream(url, headers, openai_req, timeout, max_retries)
                     _runtime_metrics.update_request_route(
@@ -1753,7 +1734,6 @@ async def messages(request: Request):
             url = provider["api_base_url"]
             openai_req["priority"] = request_priority
             headers = _provider_headers(provider)
-            metrics_ctx.tokenizer_path = _resolve_tokenizer_path(provider)
             try:
                 _runtime_metrics.update_request_route(
                     metrics_ctx,
@@ -1800,13 +1780,6 @@ async def _stream_response(
     _text_buf: list[str] | None = [] if _debug_enabled() else None
     usage: dict | None = None
     completed = False
-    output_tokenizer = None
-    output_parts: list[str] = []
-    if metrics_ctx is not None and metrics_ctx.tokenizer_path:
-        try:
-            output_tokenizer = _get_tokenizer(metrics_ctx.tokenizer_path)
-        except Exception:
-            logger.debug("Realtime output tokenizer unavailable", exc_info=True)
 
     try:
         async for event in stream_openai_to_anthropic(stream, message_id, model):
@@ -1819,29 +1792,6 @@ async def _stream_response(
                     continue
                 if parsed.get("type") == "message_delta" and isinstance(parsed.get("usage"), dict):
                     usage = _usage_from_anthropic_message(parsed)
-                elif (
-                    output_tokenizer is not None
-                    and parsed.get("type") == "content_block_delta"
-                    and isinstance(parsed.get("delta"), dict)
-                ):
-                    delta = parsed["delta"]
-                    piece = ""
-                    if delta.get("type") == "text_delta":
-                        piece = delta.get("text") or ""
-                    elif delta.get("type") == "thinking_delta":
-                        piece = delta.get("thinking") or ""
-                    elif delta.get("type") == "input_json_delta":
-                        piece = delta.get("partial_json") or ""
-                    if piece:
-                        output_parts.append(piece)
-                        try:
-                            estimated_tokens = len(output_tokenizer.encode("".join(output_parts)))
-                        except Exception:
-                            logger.debug("Realtime output token estimation failed", exc_info=True)
-                            output_tokenizer = None
-                        else:
-                            if metrics_ctx is not None:
-                                _runtime_metrics.update_request_output_tokens(metrics_ctx, estimated_tokens)
             # Accumulate text for debug check (zero cost when CCR_DEBUG is off)
             if _text_buf is not None:
                 for line in event.split("\n"):
