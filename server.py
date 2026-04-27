@@ -62,18 +62,8 @@ _DP_SERVER_INFO_TTL_SEC = 30
 _INVALID_DP_RANK_RE = re.compile(r"routed_dp_rank.*out of range", re.IGNORECASE | re.DOTALL)
 _WHITESPACE_RE = re.compile(r"\s+")
 _CONFIG_RELOAD_INTERVAL_SEC = 1.0
-_MAIN_REQUEST_PRIORITY = 20
-_SUBAGENT_REQUEST_PRIORITY = 10
-_COMPACT_REQUEST_PRIORITY = 0
-_INTERACTIVE_AGENT_MARKER = "You are an interactive agent that helps users with software engineering tasks."
-_SUBAGENT_SYSTEM_MARKER = "You are an agent for Claude Code, Anthropic's official CLI for Claude."
-_COMPACT_REQUEST_MARKERS = (
-    "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.",
-    "<analysis>",
-    "<summary>",
-    "Primary Request and Intent:",
-    "Pending Tasks:",
-)
+_MAIN_REQUEST_PRIORITY = 0
+_PROVIDER_RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
 @dataclass
@@ -724,65 +714,8 @@ def _extract_subagent_hash_input(req: dict) -> str | None:
     return text
 
 
-def _extract_last_user_text(req: dict) -> str:
-    """Extract the last user text payload as a single string."""
-    messages = req.get("messages")
-    if not isinstance(messages, list):
-        return ""
-
-    for message in reversed(messages):
-        if not isinstance(message, dict) or message.get("role") != "user":
-            continue
-
-        content = message.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts: list[str] = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text = block.get("text")
-                    if isinstance(text, str):
-                        parts.append(text)
-            return "\n".join(parts)
-        return ""
-
-    return ""
-
-
-def _is_compact_request(req: dict) -> bool:
-    """Identify Claude Code compaction requests from their summary prompt shape."""
-    last_user_text = _extract_last_user_text(req)
-    if not last_user_text:
-        return False
-    return all(marker in last_user_text for marker in _COMPACT_REQUEST_MARKERS)
-
-
-def _extract_system_texts(req: dict) -> list[str]:
-    system = req.get("system")
-    if isinstance(system, str):
-        return [system]
-    if isinstance(system, list):
-        texts: list[str] = []
-        for block in system:
-            if isinstance(block, dict):
-                text = block.get("text")
-                if isinstance(text, str):
-                    texts.append(text)
-        return texts
-    return []
-
-
-def _is_subagent_request(req: dict) -> bool:
-    """Identify Claude Code subagent requests from their dedicated system prompt."""
-    system_text = "\n".join(_extract_system_texts(req))
-    if _SUBAGENT_SYSTEM_MARKER not in system_text:
-        return False
-    return _INTERACTIVE_AGENT_MARKER not in system_text
-
-
 def _resolve_request_priority(request: Request, anthropic_req: dict) -> int:
-    """Resolve SGLang request priority from an explicit header or Claude Code request shape."""
+    """Resolve SGLang request priority from an explicit header, defaulting to 0."""
     request_priority = request.headers.get(_REQUEST_PRIORITY_HEADER)
     if request_priority is not None:
         try:
@@ -790,10 +723,6 @@ def _resolve_request_priority(request: Request, anthropic_req: dict) -> int:
         except ValueError:
             logger.info("Ignoring invalid %s=%r", _REQUEST_PRIORITY_HEADER, request_priority)
 
-    if _is_compact_request(anthropic_req):
-        return _COMPACT_REQUEST_PRIORITY
-    if _is_subagent_request(anthropic_req):
-        return _SUBAGENT_REQUEST_PRIORITY
     return _MAIN_REQUEST_PRIORITY
 
 
@@ -1082,9 +1011,9 @@ async def _build_routing_slots(model: str, *, force_refresh: bool = False) -> li
     for provider in providers:
         provider_key = _dp_cache_key(provider)
         provider_name = provider.get("name", "")
-        synthetic_dp_rank = 0 if len(providers) == 1 else None
         dp_size = None
-        if _dp_routing_config(provider) is not None:
+        dp_config = _dp_routing_config(provider)
+        if dp_config is not None:
             dp_size = await _get_provider_dp_size(provider, force_refresh=force_refresh)
             if dp_size is not None:
                 _dp_size_cache[provider_key] = {"dp_size": dp_size, "fetched_at": time.monotonic()}
@@ -1102,15 +1031,21 @@ async def _build_routing_slots(model: str, *, force_refresh: bool = False) -> li
                 ))
                 flat_index += 1
             continue
+        if dp_size is not None:
+            provider_dp_rank = 0
+            slot_dp_size = 1
+        else:
+            provider_dp_rank = 0 if len(providers) == 1 and dp_config is None else None
+            slot_dp_size = 1 if provider_dp_rank is not None else None
         slots.append(RoutingSlot(
             flat_index=flat_index,
-            slot_id=_provider_slot_id(provider, synthetic_dp_rank),
+            slot_id=_provider_slot_id(provider, provider_dp_rank),
             provider=provider,
             provider_key=provider_key,
             provider_name=provider_name,
             model=model,
-            provider_dp_rank=synthetic_dp_rank,
-            dp_size=1 if synthetic_dp_rank is not None else dp_size,
+            provider_dp_rank=provider_dp_rank,
+            dp_size=slot_dp_size,
         ))
         flat_index += 1
     return slots
@@ -1293,6 +1228,12 @@ def _is_invalid_dp_rank_error(exc: ProviderError) -> bool:
     return bool(_INVALID_DP_RANK_RE.search(exc.body))
 
 
+def _is_retryable_provider_failure(exc: Exception) -> bool:
+    if isinstance(exc, ProviderError):
+        return exc.status in _PROVIDER_RETRY_STATUSES or exc.status == 0
+    return isinstance(exc, (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError))
+
+
 def _log_dp_routing(provider: dict, decision: DPRoutingDecision, remapped: bool = False) -> None:
     if decision.rank is None:
         return
@@ -1466,6 +1407,70 @@ async def _retry_message_request_for_invalid_rank(
     _log_dp_routing(selected_slot.provider, new_decision, remapped=(new_decision.rank != old_decision.rank))
     log_openai_request(openai_req)
     return selected_slot, openai_req, new_decision
+
+
+class NoProviderRetryLeft(Exception):
+    pass
+
+
+async def _resolve_retry_routing(
+    request: Request,
+    model: str,
+    anthropic_req: dict,
+    base_openai_req: dict,
+    attempted_provider_keys: set[str],
+    *,
+    force_refresh: bool = False,
+) -> tuple[RoutingSlot, dict, DPRoutingDecision]:
+    provider_keys = {_dp_cache_key(provider) for provider in _providers_for_model(model)}
+    if provider_keys and provider_keys.issubset(attempted_provider_keys):
+        raise NoProviderRetryLeft()
+
+    openai_req = dict(base_openai_req)
+    slots = await _build_routing_slots(model, force_refresh=force_refresh)
+    remaining_slots = [slot for slot in slots if slot.provider_key not in attempted_provider_keys]
+    if not remaining_slots:
+        raise NoProviderRetryLeft()
+
+    slot_by_id = {slot.slot_id: slot for slot in remaining_slots}
+    slot_loads = _slot_loads_for_slots(remaining_slots)
+    session_id = request.headers.get(_CLAUDE_SESSION_HEADER) or str(uuid.uuid4())
+    sticky_key, sticky_source, subagent_id = _derive_sticky_key(session_id, anthropic_req)
+
+    allocator = _get_or_create_model_allocator(model, slots)
+    current_slot_id = allocator.sessions.get(sticky_key)
+    if current_slot_id in slot_by_id:
+        selected_slot = slot_by_id[current_slot_id]
+    else:
+        selected_slot = min(
+            remaining_slots,
+            key=lambda slot: (
+                int(slot_loads.get(slot.slot_id, 0)),
+                allocator.slot_last_used.get(slot.slot_id, 0.0),
+                slot.flat_index,
+            ),
+        )
+        allocator.reassign(sticky_key, selected_slot.slot_id)
+
+    selected_slot, remapped = _maybe_reassign_dp_slot(allocator, sticky_key, selected_slot, slot_by_id)
+
+    if selected_slot.provider_dp_rank is not None:
+        openai_req["routed_dp_rank"] = selected_slot.provider_dp_rank
+    decision = DPRoutingDecision(
+        provider_key=selected_slot.provider_key,
+        provider_name=selected_slot.provider_name,
+        dp_size=selected_slot.dp_size,
+        rank=selected_slot.flat_index,
+        provider_dp_rank=selected_slot.provider_dp_rank,
+        source=sticky_source,
+        sticky_key=sticky_key,
+        session_id=session_id,
+        subagent_id=subagent_id,
+    )
+    openai_req = apply_provider_params(selected_slot.provider, openai_req)
+    _log_dp_routing(selected_slot.provider, decision, remapped=remapped)
+    log_openai_request(openai_req)
+    return selected_slot, openai_req, decision
 
 
 _tokenizer_cache: dict[str, object] = {}  # tokenizer_path → tokenizer
@@ -1672,8 +1677,88 @@ async def messages(request: Request):
 
     if is_stream:
         # Eagerly connect to check provider status before committing to HTTP 200
+        attempted_provider_keys: set[str] = set()
+        while True:
+            try:
+                stream = await open_provider_stream(url, headers, openai_req, timeout, max_retries)
+                break
+            except ProviderError as exc:
+                if _is_invalid_dp_rank_error(exc) and dp_decision.rank is not None:
+                    selected_slot, openai_req, dp_decision = await _retry_message_request_for_invalid_rank(
+                        request,
+                        model,
+                        body,
+                        base_openai_req,
+                        dp_decision,
+                    )
+                    provider = selected_slot.provider
+                    url = provider["api_base_url"]
+                    openai_req["priority"] = request_priority
+                    headers = _provider_headers(provider)
+                    max_retries = provider.get("max_retries", 3)
+                    _runtime_metrics.update_request_route(
+                        metrics_ctx,
+                        provider_key=_dp_cache_key(provider),
+                        provider_name=provider.get("name", ""),
+                        dp_rank=dp_decision.provider_dp_rank,
+                    )
+                    continue
+                if not _is_retryable_provider_failure(exc):
+                    _runtime_metrics.finish_request(metrics_ctx, success=False)
+                    raise HTTPException(exc.status or 502, exc.body or str(exc))
+                logger.warning("Provider stream failed, trying another provider if available: %s", exc)
+                attempted_provider_keys.add(_dp_cache_key(provider))
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
+                logger.warning("Provider stream connection failed, trying another provider if available: %s", exc)
+                attempted_provider_keys.add(_dp_cache_key(provider))
+            except Exception as exc:
+                logger.exception("Stream connection error")
+                _runtime_metrics.finish_request(metrics_ctx, success=False)
+                raise HTTPException(502, str(exc))
+
+            try:
+                selected_slot, openai_req, dp_decision = await _resolve_retry_routing(
+                    request,
+                    model,
+                    body,
+                    base_openai_req,
+                    attempted_provider_keys,
+                    force_refresh=True,
+                )
+                provider = selected_slot.provider
+                url = provider["api_base_url"]
+                openai_req["priority"] = request_priority
+                headers = _provider_headers(provider)
+                max_retries = provider.get("max_retries", 3)
+                _runtime_metrics.update_request_route(
+                    metrics_ctx,
+                    provider_key=_dp_cache_key(provider),
+                    provider_name=provider.get("name", ""),
+                    dp_rank=dp_decision.provider_dp_rank,
+                )
+            except HTTPException:
+                _runtime_metrics.finish_request(metrics_ctx, success=False)
+                raise
+            except NoProviderRetryLeft:
+                _runtime_metrics.finish_request(metrics_ctx, success=False)
+                raise HTTPException(502, "All configured providers are unavailable")
+
+        return StreamingResponse(
+            _stream_response(openai_req, stream, model, metrics_ctx=metrics_ctx),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                **dp_decision.response_headers(),
+            },
+        )
+
+    # Non-streaming
+    attempted_provider_keys: set[str] = set()
+    while True:
         try:
-            stream = await open_provider_stream(url, headers, openai_req, timeout, max_retries)
+            openai_resp = await post_json(url, headers, openai_req, timeout=timeout, max_retries=max_retries)
+            break
         except ProviderError as exc:
             if _is_invalid_dp_rank_error(exc) and dp_decision.rank is not None:
                 selected_slot, openai_req, dp_decision = await _retry_message_request_for_invalid_rank(
@@ -1687,75 +1772,51 @@ async def messages(request: Request):
                 url = provider["api_base_url"]
                 openai_req["priority"] = request_priority
                 headers = _provider_headers(provider)
-                try:
-                    stream = await open_provider_stream(url, headers, openai_req, timeout, max_retries)
-                    _runtime_metrics.update_request_route(
-                        metrics_ctx,
-                        provider_key=_dp_cache_key(provider),
-                        provider_name=provider.get("name", ""),
-                        dp_rank=dp_decision.provider_dp_rank,
-                    )
-                except ProviderError as retry_exc:
-                    _runtime_metrics.finish_request(metrics_ctx, success=False)
-                    raise HTTPException(retry_exc.status or 502, retry_exc.body or str(retry_exc))
-            else:
-                _runtime_metrics.finish_request(metrics_ctx, success=False)
-                raise HTTPException(exc.status or 502, exc.body or str(exc))
-        except Exception as exc:
-            logger.exception("Stream connection error")
-            _runtime_metrics.finish_request(metrics_ctx, success=False)
-            raise HTTPException(502, str(exc))
-
-        return StreamingResponse(
-            _stream_response(openai_req, stream, model, metrics_ctx=metrics_ctx),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-                **dp_decision.response_headers(),
-            },
-        )
-
-    # Non-streaming
-    try:
-        openai_resp = await post_json(
-            url, headers, openai_req, timeout=timeout, max_retries=max_retries
-        )
-    except ProviderError as exc:
-        if _is_invalid_dp_rank_error(exc) and dp_decision.rank is not None:
-            selected_slot, openai_req, dp_decision = await _retry_message_request_for_invalid_rank(
-                request,
-                model,
-                body,
-                base_openai_req,
-                dp_decision,
-            )
-            provider = selected_slot.provider
-            url = provider["api_base_url"]
-            openai_req["priority"] = request_priority
-            headers = _provider_headers(provider)
-            try:
+                max_retries = provider.get("max_retries", 3)
                 _runtime_metrics.update_request_route(
                     metrics_ctx,
                     provider_key=_dp_cache_key(provider),
                     provider_name=provider.get("name", ""),
                     dp_rank=dp_decision.provider_dp_rank,
                 )
-                openai_resp = await post_json(
-                    url, headers, openai_req, timeout=timeout, max_retries=max_retries
-                )
-            except ProviderError as retry_exc:
-                logger.error("Provider error after DP refresh: %s", retry_exc)
+                continue
+            if not _is_retryable_provider_failure(exc):
+                logger.error("Provider error: %s", exc)
                 _runtime_metrics.finish_request(metrics_ctx, success=False)
-                raise HTTPException(retry_exc.status or 502, retry_exc.body or str(retry_exc))
-        else:
-            logger.error("Provider error: %s", exc)
+                raise HTTPException(exc.status or 502, exc.body or str(exc))
+            logger.warning("Provider error, trying another provider if available: %s", exc)
+            attempted_provider_keys.add(_dp_cache_key(provider))
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
+            logger.warning("Provider connection failed, trying another provider if available: %s", exc)
+            attempted_provider_keys.add(_dp_cache_key(provider))
+        except Exception as exc:
+            logger.exception("Unexpected error calling provider")
             _runtime_metrics.finish_request(metrics_ctx, success=False)
-            raise HTTPException(exc.status or 502, exc.body or str(exc))
-    except Exception as exc:
-        logger.exception("Unexpected error calling provider")
-        _runtime_metrics.finish_request(metrics_ctx, success=False)
-        raise HTTPException(502, str(exc))
+            raise HTTPException(502, str(exc))
+
+        try:
+            selected_slot, openai_req, dp_decision = await _resolve_retry_routing(
+                request,
+                model,
+                body,
+                base_openai_req,
+                attempted_provider_keys,
+                force_refresh=True,
+            )
+        except NoProviderRetryLeft:
+            _runtime_metrics.finish_request(metrics_ctx, success=False)
+            raise HTTPException(502, "All configured providers are unavailable")
+        provider = selected_slot.provider
+        url = provider["api_base_url"]
+        openai_req["priority"] = request_priority
+        headers = _provider_headers(provider)
+        max_retries = provider.get("max_retries", 3)
+        _runtime_metrics.update_request_route(
+            metrics_ctx,
+            provider_key=_dp_cache_key(provider),
+            provider_name=provider.get("name", ""),
+            dp_rank=dp_decision.provider_dp_rank,
+        )
 
     check_and_save_nonstreaming(openai_req, openai_resp)
     anthropic_resp = openai_to_anthropic(openai_resp, model)

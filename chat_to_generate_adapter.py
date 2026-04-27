@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
@@ -164,6 +165,37 @@ def parse_message_local(completion_text, model_type, tools):
         "tool_calls": tool_calls,
         "calls": tool_calls,
     }
+
+
+def _normalize_parsed_response(
+    parsed_response: Dict[str, Any],
+    raw_text: str,
+) -> Dict[str, Any]:
+    """Preserve plain assistant text when the parser cannot structure it."""
+    normalized = dict(parsed_response)
+    content = (normalized.get("content") or "").strip()
+    reasoning_content = (normalized.get("reasoning_content") or "").strip()
+    tool_calls = normalized.get("tool_calls") or []
+    cleaned_raw_text = raw_text.rstrip()
+    if cleaned_raw_text.endswith("<|user|>"):
+        cleaned_raw_text = cleaned_raw_text[:-8].rstrip()
+
+    # If the model returned plain text without reasoning/tool markers, treat it
+    # as assistant content instead of synthesizing an empty message.
+    if cleaned_raw_text and not content and not tool_calls and "</think>" not in raw_text and "<tool_call>" not in raw_text:
+        normalized["content"] = cleaned_raw_text
+        if reasoning_content == cleaned_raw_text:
+            normalized["reasoning_content"] = ""
+
+    return normalized
+
+
+def _ensure_non_empty_response(parsed_response: Dict[str, Any], error_message: str) -> None:
+    content = (parsed_response.get("content") or "").strip()
+    reasoning_content = (parsed_response.get("reasoning_content") or "").strip()
+    tool_calls = parsed_response.get("tool_calls") or []
+    if not content and not reasoning_content and not tool_calls:
+        raise RuntimeError(error_message)
 
 
 class ChatToGenerateAdapter:
@@ -588,6 +620,18 @@ class ChatToGenerateAdapter:
         openai_tool_calls = self._normalize_tool_calls_to_openai(raw_tool_calls) if raw_tool_calls else []
         if openai_tool_calls:
             finish_reason = "tool_calls"
+        parsed = _normalize_parsed_response(
+            {
+                "content": content,
+                "reasoning_content": reasoning_content,
+                "tool_calls": openai_tool_calls,
+            },
+            text,
+        )
+        _ensure_non_empty_response(parsed, "API returned an empty response")
+        content = parsed.get("content", "")
+        reasoning_content = parsed.get("reasoning_content", "")
+        openai_tool_calls = parsed.get("tool_calls", []) or []
 
         async def iterator():
             if reasoning_content:
@@ -642,6 +686,7 @@ class ChatToGenerateAdapter:
             text_buf = []
             last_usage = None
             last_finish_reason = None
+            emitted_payload = False
             try:
                 async for raw in stream:
                     line = raw.decode("utf-8", errors="ignore").strip()
@@ -650,20 +695,35 @@ class ChatToGenerateAdapter:
                     payload = line[6:]
                     if payload == "[DONE]":
                         # Parse accumulated text for tool calls
-                        if chat_tools and text_buf:
-                            full_text = "".join(text_buf)
-                            full_text = full_text.rstrip()
+                        if chat_tools:
+                            full_text = "".join(text_buf).rstrip()
                             if full_text.endswith("(prompt"):
                                 full_text = full_text[:-8].rstrip()
-                            full_text = f"\U0001f508{full_text}"
-                            parsed = parse_message_local(full_text, "glm47", chat_tools)
+                            if full_text:
+                                parsed = parse_message_local(f"\U0001f508{full_text}", "glm47", chat_tools)
+                            else:
+                                parsed = {"content": "", "reasoning_content": "", "tool_calls": []}
+                            parsed = _normalize_parsed_response(parsed, full_text)
+                            parsed_content = parsed.get("content", "")
+                            parsed_reasoning = parsed.get("reasoning_content", "")
                             raw_tcs = parsed.get("tool_calls", [])
                             openai_tcs = self._normalize_tool_calls_to_openai(raw_tcs) if raw_tcs else []
+                            if parsed_reasoning:
+                                yield self._chat_chunk_sse(
+                                    request_id, created, self.model, reasoning_content=parsed_reasoning,
+                                )
+                                emitted_payload = True
+                            if parsed_content:
+                                yield self._chat_chunk_sse(request_id, created, self.model, content=parsed_content)
+                                emitted_payload = True
                             if openai_tcs:
                                 yield self._chat_chunk_sse(
                                     request_id, created, self.model, tool_calls=openai_tcs,
                                 )
                                 last_finish_reason = "tool_calls"
+                                emitted_payload = True
+                        if not emitted_payload:
+                            raise RuntimeError("API returned an empty response")
                         yield self._chat_chunk_sse(
                             request_id, created, self.model,
                             finish_reason=last_finish_reason,
@@ -691,6 +751,7 @@ class ChatToGenerateAdapter:
                         # If we have tools, buffer text; otherwise stream immediately
                         if not chat_tools:
                             yield self._chat_chunk_sse(request_id, created, self.model, content=text)
+                            emitted_payload = True
                     if finish_reason is not None:
                         last_finish_reason = finish_reason
                     if usage:
@@ -814,6 +875,8 @@ class ChatToGenerateAdapter:
         if content.endswith('<|user|>'):
             content = content[:-8].rstrip()
             parsed['content'] = content
+        parsed = _normalize_parsed_response(parsed, text)
+        _ensure_non_empty_response(parsed, "API returned an empty response")
 
         meta_info = response_data.get("meta_info", {})
         usage = {
@@ -995,10 +1058,13 @@ class ChatToGenerateAdapter:
         completion_text = completion_text.rstrip()
         if completion_text.endswith("<|user|>"):
             completion_text = completion_text[:-8].rstrip()
+        raw_completion_text = completion_text
 
         completion_text = f"<think>{completion_text}"
         
         parsed = parse_message_local(completion_text, "glm47", tools_for_parser)
+        parsed = _normalize_parsed_response(parsed, raw_completion_text)
+        _ensure_non_empty_response(parsed, "API returned an empty response")
 
         content = parsed.get("content", "")
         reasoning_content = parsed.get("reasoning_content", "")

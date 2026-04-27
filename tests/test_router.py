@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from client import ProviderStream
+from client import ProviderStream, _connect_retry_delay, open_provider_stream, post_json
 from converter import anthropic_to_openai, openai_to_anthropic, stream_openai_to_anthropic
 from config import (
     apply_provider_params,
@@ -626,6 +626,75 @@ class TestUpstreamTimeout(unittest.TestCase):
         self.assertEqual(timeout.read, 120.0)
         self.assertEqual(timeout.write, 120.0)
         self.assertEqual(timeout.pool, 120.0)
+
+
+class TestConnectFailureHold(unittest.IsolatedAsyncioTestCase):
+
+    def test_connect_retry_delay_caps_at_one_minute(self):
+        self.assertEqual(_connect_retry_delay(1), 1.0)
+        self.assertEqual(_connect_retry_delay(2), 2.0)
+        self.assertEqual(_connect_retry_delay(3), 4.0)
+        self.assertEqual(_connect_retry_delay(7), 60.0)
+        self.assertEqual(_connect_retry_delay(20), 60.0)
+
+    async def test_post_json_raises_after_retries_exhausted(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = 0
+
+            async def post(self, *args, **kwargs):
+                self.calls += 1
+                raise httpx.ConnectError("boom")
+
+        fake_client = FakeClient()
+        sleep_delays = []
+
+        async def fake_sleep(delay):
+            sleep_delays.append(delay)
+
+        with patch("client.get_shared_client", return_value=fake_client), \
+             patch("client.asyncio.sleep", new=fake_sleep):
+            with self.assertRaises(httpx.ConnectError):
+                await post_json(
+                    "http://provider",
+                    {},
+                    {},
+                    max_retries=1,
+                )
+
+        self.assertEqual(fake_client.calls, 2)
+        self.assertEqual(sleep_delays, [1.0])
+
+    async def test_open_provider_stream_raises_after_retries_exhausted(self):
+        class FakeAsyncClient:
+            def __init__(self, *args, **kwargs):
+                self.closed = False
+
+            def build_request(self, *args, **kwargs):
+                return object()
+
+            async def send(self, req, stream=False):
+                raise httpx.ConnectError("boom")
+
+            async def aclose(self):
+                self.closed = True
+
+        sleep_delays = []
+
+        async def fake_sleep(delay):
+            sleep_delays.append(delay)
+
+        with patch("client.httpx.AsyncClient", new=FakeAsyncClient), \
+             patch("client.asyncio.sleep", new=fake_sleep):
+            with self.assertRaises(httpx.ConnectError):
+                await open_provider_stream(
+                    "http://provider",
+                    {},
+                    {},
+                    max_retries=1,
+                )
+
+        self.assertEqual(sleep_delays, [1.0])
 
 
 # ============================================================================
@@ -1446,7 +1515,7 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent_requests[0][1]["priority"], self.srv._MAIN_REQUEST_PRIORITY)
         self.assertNotIn(self.srv._REQUEST_PRIORITY_HEADER, sent_requests[0][0])
 
-    async def test_messages_infer_subagent_priority(self):
+    async def test_messages_subagent_request_uses_default_priority(self):
         sent_bodies = []
 
         async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
@@ -1461,9 +1530,9 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertEqual(sent_bodies[0]["priority"], self.srv._SUBAGENT_REQUEST_PRIORITY)
+        self.assertEqual(sent_bodies[0]["priority"], self.srv._MAIN_REQUEST_PRIORITY)
 
-    async def test_messages_infer_compact_priority(self):
+    async def test_messages_compact_request_uses_default_priority(self):
         sent_bodies = []
 
         async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
@@ -1478,7 +1547,7 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertEqual(sent_bodies[0]["priority"], self.srv._COMPACT_REQUEST_PRIORITY)
+        self.assertEqual(sent_bodies[0]["priority"], self.srv._MAIN_REQUEST_PRIORITY)
 
     async def test_messages_prefer_lower_active_requests_even_if_newer(self):
         sent_bodies = []
@@ -1956,6 +2025,73 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent_bodies[1]["routed_dp_rank"], 0)
         self.assertEqual(sent_bodies[1]["priority"], self.srv._MAIN_REQUEST_PRIORITY)
         self.assertEqual(resp.headers["X-Router-DP-Rank"], "0")
+
+    async def test_provider_failure_retries_with_different_provider(self):
+        sent_requests = []
+        self.srv.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [
+                {
+                    "name": "first",
+                    "model": "/model",
+                    "api_base_url": "http://first:8000/v1/chat/completions",
+                    "api_key": "k1",
+                    "max_retries": 0,
+                },
+                {
+                    "name": "second",
+                    "model": "/model",
+                    "api_base_url": "http://second:8000/v1/chat/completions",
+                    "api_key": "k2",
+                    "max_retries": 0,
+                },
+            ],
+            "Router": {"default": "/model"},
+        })
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_requests.append((url, dict(body)))
+            if len(sent_requests) == 1:
+                raise self.srv.ProviderError(503, "offline")
+            return self._openai_resp()
+
+        with patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._CLAUDE_SESSION_HEADER: "session-sticky"},
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual([req[0] for req in sent_requests], [
+            "http://first:8000/v1/chat/completions",
+            "http://second:8000/v1/chat/completions",
+        ])
+        self.assertEqual(resp.headers["X-Router-Provider"], "second")
+
+    async def test_invalid_rank_refresh_without_dp_size_does_not_send_rank_zero(self):
+        sent_bodies = []
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_bodies.append(dict(body))
+            if len(sent_bodies) == 1:
+                raise self.srv.ProviderError(
+                    400,
+                    f"ValueError: routed_dp_rank={body['routed_dp_rank']} out of range [0, 0)",
+                )
+            raise self.srv.ProviderError(503, "offline")
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(side_effect=[2, None])), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._CLAUDE_SESSION_HEADER: "session-sticky"},
+            )
+
+        self.assertEqual(resp.status_code, 502)
+        self.assertEqual(sent_bodies[0]["routed_dp_rank"], 0)
+        self.assertNotIn("routed_dp_rank", sent_bodies[1])
 
     async def test_override_invalid_after_refresh_returns_400_without_remap(self):
         sent_bodies = []
@@ -2568,6 +2704,7 @@ if __name__ == "__main__":
     if mode in ("unit", "all"):
         for cls in (TestAnthropicToOpenAI, TestOpenAIToAnthropic,
                     TestStreamConverter, TestProviderStreamRetry,
+                    TestConnectFailureHold,
                     TestConfig, TestApplyProviderParams,
                     TestBatchConversion, TestLegacyPromptParsing, TestURLHelpers,
                     TestDPRoutingHelpers, TestMessagesDPRouting, TestMetricsEndpoint,

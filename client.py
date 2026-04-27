@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from typing import AsyncIterator
+from typing import Awaitable, Callable
 
 import httpx
 
@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
 _CONNECT_TIMEOUT_SEC = 3.0
+_MAX_CONNECT_RETRY_DELAY_SEC = 60.0
 
 # Shared HTTP client for non-streaming requests (connection pooling)
 _shared_client: httpx.AsyncClient | None = None
@@ -52,11 +53,13 @@ class ProviderStream:
         client: httpx.AsyncClient,
         reconnect=None,
         max_retries: int = 0,
+        disconnect_check: Callable[[], Awaitable[bool]] | None = None,
     ):
         self._response = response
         self._client = client
         self._reconnect = reconnect
         self._max_retries = max_retries
+        self._disconnect_check = disconnect_check
 
     async def __aiter__(self):
         attempt = 0
@@ -70,23 +73,30 @@ class ProviderStream:
                         yield line.encode()
                 return
             except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
-                can_retry = (
-                    not yielded_any
-                    and self._reconnect is not None
-                    and attempt < self._max_retries
-                )
+                can_retry = not yielded_any and self._reconnect is not None
                 if not can_retry:
                     raise
 
                 attempt += 1
-                logger.warning(
-                    "Stream read error before first chunk (attempt %d/%d): %s",
-                    attempt,
-                    self._max_retries,
-                    exc,
-                )
                 await self.aclose()
-                await asyncio.sleep(1)
+                if attempt <= self._max_retries:
+                    logger.warning(
+                        "Stream read error before first chunk (attempt %d/%d): %s",
+                        attempt,
+                        self._max_retries,
+                        exc,
+                    )
+                else:
+                    logger.warning(
+                        "Stream read error before first chunk after retries exhausted; "
+                        "holding request open and retrying (attempt %d): %s",
+                        attempt,
+                        exc,
+                    )
+                await _sleep_with_disconnect(
+                    _connect_retry_delay(attempt),
+                    self._disconnect_check,
+                )
                 self._response, self._client = await self._reconnect()
 
     async def aiter_raw(self):
@@ -105,21 +115,27 @@ async def post_json(
     body: dict,
     timeout: float = 600.0,
     max_retries: int = 3,
+    disconnect_check: Callable[[], Awaitable[bool]] | None = None,
 ) -> dict:
     """POST JSON, return parsed response dict. Retries on transient errors."""
     last_exc: Exception | None = None
     client = get_shared_client()
 
-    for attempt in range(max_retries + 1):
+    attempt = 0
+    while True:
         if attempt > 0:
-            logger.warning("Retry %d/%d after sleep", attempt, max_retries)
-            await asyncio.sleep(1)
+            if attempt <= max_retries:
+                logger.warning("Retry %d/%d after sleep", attempt, max_retries)
+                await asyncio.sleep(1)
+            else:
+                raise last_exc or ProviderError(0, "Unknown error after retries")
 
         try:
             resp = await client.post(url, headers=headers, json=body, timeout=upstream_timeout(timeout))
         except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
             last_exc = exc
             logger.warning("Connection error (attempt %d): %s", attempt + 1, exc)
+            attempt += 1
             continue
 
         if resp.status_code in _RETRY_STATUSES and attempt < max_retries:
@@ -128,14 +144,13 @@ async def post_json(
                 resp.status_code, attempt + 1,
             )
             last_exc = ProviderError(resp.status_code, resp.text)
+            attempt += 1
             continue
 
         if resp.status_code >= 400:
             raise ProviderError(resp.status_code, resp.text)
 
         return resp.json()
-
-    raise last_exc or ProviderError(0, "Unknown error after retries")
 
 
 async def open_provider_stream(
@@ -144,6 +159,7 @@ async def open_provider_stream(
     body: dict,
     timeout: float = 600.0,
     max_retries: int = 3,
+    disconnect_check: Callable[[], Awaitable[bool]] | None = None,
 ) -> ProviderStream:
     """
     Eagerly open a streaming connection to the provider.
@@ -163,16 +179,21 @@ async def open_provider_stream(
             raise
         return resp, client
 
-    for attempt in range(max_retries + 1):
+    attempt = 0
+    while True:
         if attempt > 0:
-            logger.warning("Stream retry %d/%d after sleep", attempt, max_retries)
-            await asyncio.sleep(1)
+            if attempt <= max_retries:
+                logger.warning("Stream retry %d/%d after sleep", attempt, max_retries)
+                await asyncio.sleep(1)
+            else:
+                raise last_exc or ProviderError(0, "Unknown error after retries")
 
         try:
             resp, client = await _connect()
         except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
             last_exc = exc
             logger.warning("Stream connection error (attempt %d): %s", attempt + 1, exc)
+            attempt += 1
             continue
 
         if resp.status_code in _RETRY_STATUSES and attempt < max_retries:
@@ -183,6 +204,7 @@ async def open_provider_stream(
             last_exc = ProviderError(resp.status_code, "")
             await resp.aclose()
             await client.aclose()
+            attempt += 1
             continue
 
         if resp.status_code >= 400:
@@ -196,6 +218,28 @@ async def open_provider_stream(
             client,
             reconnect=_connect,
             max_retries=max_retries,
+            disconnect_check=disconnect_check,
         )
 
-    raise last_exc or ProviderError(0, "Unknown error after retries")
+
+def _connect_retry_delay(attempt: int) -> float:
+    """Return exponential backoff in seconds, capped at one minute."""
+    return min(float(2 ** max(attempt - 1, 0)), _MAX_CONNECT_RETRY_DELAY_SEC)
+
+
+async def _sleep_with_disconnect(
+    delay: float,
+    disconnect_check: Callable[[], Awaitable[bool]] | None,
+) -> None:
+    """Sleep in small increments so held requests stop once the client disconnects."""
+    if disconnect_check is None:
+        await asyncio.sleep(delay)
+        return
+
+    remaining = delay
+    while remaining > 0:
+        if await disconnect_check():
+            raise asyncio.CancelledError("Client disconnected while waiting for upstream")
+        interval = min(1.0, remaining)
+        await asyncio.sleep(interval)
+        remaining -= interval
