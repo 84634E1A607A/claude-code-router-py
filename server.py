@@ -1006,8 +1006,7 @@ def _slot_loads_for_slots(slots: list[RoutingSlot]) -> dict[str, int]:
 
 async def _build_routing_slots(model: str, *, force_refresh: bool = False) -> list[RoutingSlot]:
     providers = _providers_for_model(model)
-    slots: list[RoutingSlot] = []
-    flat_index = 0
+    provider_slot_rows: list[list[dict[str, Any]]] = []
     for provider in providers:
         provider_key = _dp_cache_key(provider)
         provider_name = provider.get("name", "")
@@ -1017,37 +1016,53 @@ async def _build_routing_slots(model: str, *, force_refresh: bool = False) -> li
             dp_size = await _get_provider_dp_size(provider, force_refresh=force_refresh)
             if dp_size is not None:
                 _dp_size_cache[provider_key] = {"dp_size": dp_size, "fetched_at": time.monotonic()}
+        provider_slots: list[dict[str, Any]] = []
         if dp_size is not None and dp_size > 1:
             for provider_dp_rank in range(dp_size):
-                slots.append(RoutingSlot(
-                    flat_index=flat_index,
-                    slot_id=_provider_slot_id(provider, provider_dp_rank),
-                    provider=provider,
-                    provider_key=provider_key,
-                    provider_name=provider_name,
-                    model=model,
-                    provider_dp_rank=provider_dp_rank,
-                    dp_size=dp_size,
-                ))
-                flat_index += 1
-            continue
-        if dp_size is not None:
-            provider_dp_rank = 0
-            slot_dp_size = 1
+                provider_slots.append({
+                    "provider_dp_rank": provider_dp_rank,
+                    "dp_size": dp_size,
+                })
         else:
-            provider_dp_rank = 0 if len(providers) == 1 and dp_config is None else None
-            slot_dp_size = 1 if provider_dp_rank is not None else None
-        slots.append(RoutingSlot(
-            flat_index=flat_index,
-            slot_id=_provider_slot_id(provider, provider_dp_rank),
-            provider=provider,
-            provider_key=provider_key,
-            provider_name=provider_name,
-            model=model,
-            provider_dp_rank=provider_dp_rank,
-            dp_size=slot_dp_size,
-        ))
-        flat_index += 1
+            if dp_size is not None:
+                provider_dp_rank = 0
+                slot_dp_size = 1
+            else:
+                provider_dp_rank = 0 if len(providers) == 1 and dp_config is None else None
+                slot_dp_size = 1 if provider_dp_rank is not None else None
+            provider_slots.append({
+                "provider_dp_rank": provider_dp_rank,
+                "dp_size": slot_dp_size,
+            })
+        provider_slot_rows.append([{
+            "provider": provider,
+            "provider_key": provider_key,
+            "provider_name": provider_name,
+            "model": model,
+            **slot_spec,
+        } for slot_spec in provider_slots])
+
+    slots: list[RoutingSlot] = []
+    flat_index = 0
+    max_provider_slots = max((len(provider_slots) for provider_slots in provider_slot_rows), default=0)
+    for slot_offset in range(max_provider_slots):
+        for provider_slots in provider_slot_rows:
+            if slot_offset >= len(provider_slots):
+                continue
+            slot_spec = provider_slots[slot_offset]
+            provider = slot_spec["provider"]
+            provider_dp_rank = slot_spec["provider_dp_rank"]
+            slots.append(RoutingSlot(
+                flat_index=flat_index,
+                slot_id=_provider_slot_id(provider, provider_dp_rank),
+                provider=provider,
+                provider_key=slot_spec["provider_key"],
+                provider_name=slot_spec["provider_name"],
+                model=slot_spec["model"],
+                provider_dp_rank=provider_dp_rank,
+                dp_size=slot_spec["dp_size"],
+            ))
+            flat_index += 1
     return slots
 
 

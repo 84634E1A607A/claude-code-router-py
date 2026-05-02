@@ -1372,6 +1372,43 @@ class TestDPRoutingHelpers(unittest.IsolatedAsyncioTestCase):
         rank_two = srv_mod._rendezvous_rank("session-abc", 4)
         self.assertEqual(rank_one, rank_two)
 
+    async def test_build_routing_slots_interleaves_providers_before_dp_ranks(self):
+        import server as srv_mod
+
+        srv_mod.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [
+                {
+                    "name": "up0",
+                    "model": "/model",
+                    "api_base_url": "http://up0:8000/v1/chat/completions",
+                    "api_key": "k0",
+                    "dp_routing": {"enabled": True, "server_info_ttl_sec": 30},
+                },
+                {
+                    "name": "up1",
+                    "model": "/model",
+                    "api_base_url": "http://up1:8000/v1/chat/completions",
+                    "api_key": "k1",
+                    "dp_routing": {"enabled": True, "server_info_ttl_sec": 30},
+                },
+            ],
+            "Router": {"default": "/model"},
+        })
+
+        with patch.object(srv_mod, "_get_provider_dp_size", new=AsyncMock(side_effect=[2, 2])):
+            slots = await srv_mod._build_routing_slots("/model")
+
+        self.assertEqual(
+            [(slot.provider_name, slot.provider_dp_rank, slot.flat_index) for slot in slots],
+            [
+                ("up0", 0, 0),
+                ("up1", 0, 1),
+                ("up0", 1, 2),
+                ("up1", 1, 3),
+            ],
+        )
+
 
 class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
 
@@ -2068,6 +2105,66 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
             "http://second:8000/v1/chat/completions",
         ])
         self.assertEqual(resp.headers["X-Router-Provider"], "second")
+
+    async def test_multi_upstream_dp_pinning_prefers_upstreams_before_second_dp_rank(self):
+        sent_requests = []
+        self.srv.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [
+                {
+                    "name": "up0",
+                    "model": "/model",
+                    "api_base_url": "http://up0:8000/v1/chat/completions",
+                    "api_key": "k0",
+                    "max_retries": 1,
+                    "dp_routing": {"enabled": True, "server_info_ttl_sec": 30},
+                },
+                {
+                    "name": "up1",
+                    "model": "/model",
+                    "api_base_url": "http://up1:8000/v1/chat/completions",
+                    "api_key": "k1",
+                    "max_retries": 1,
+                    "dp_routing": {"enabled": True, "server_info_ttl_sec": 30},
+                },
+            ],
+            "Router": {"default": "/model"},
+        })
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_requests.append((url, dict(body)))
+            return self._openai_resp()
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(side_effect=[2] * 8)), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            responses = []
+            for session_id in ("session-0", "session-1", "session-2", "session-3"):
+                responses.append(await self.client.post(
+                    "/v1/messages",
+                    json=self._messages_req(),
+                    headers={self.srv._CLAUDE_SESSION_HEADER: session_id},
+                ))
+
+        for resp in responses:
+            self.assertEqual(resp.status_code, 200, resp.text)
+
+        self.assertEqual(
+            [(url, body["routed_dp_rank"]) for url, body in sent_requests],
+            [
+                ("http://up0:8000/v1/chat/completions", 0),
+                ("http://up1:8000/v1/chat/completions", 0),
+                ("http://up0:8000/v1/chat/completions", 1),
+                ("http://up1:8000/v1/chat/completions", 1),
+            ],
+        )
+        self.assertEqual(
+            [resp.headers["X-Router-DP-Rank"] for resp in responses],
+            ["0", "1", "2", "3"],
+        )
+        self.assertEqual(
+            [resp.headers["X-Router-Provider-DP-Rank"] for resp in responses],
+            ["0", "0", "1", "1"],
+        )
 
     async def test_invalid_rank_refresh_without_dp_size_does_not_send_rank_zero(self):
         sent_bodies = []
