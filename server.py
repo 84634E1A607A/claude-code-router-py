@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 # Populated either by set_config() (single-process) or lifespan (multi-worker).
 _config: dict = {}
 _dp_size_cache: dict[str, dict[str, float | int]] = {}
+_sglang_health_cache: dict[str, dict[str, float | bool]] = {}
 _providers_by_model: dict[str, list[dict]] = {}
 _available_models: tuple[str, ...] = ()
 _config_path: str | None = None
@@ -59,6 +60,7 @@ _CLAUDE_SESSION_HEADER = "X-Claude-Code-Session-Id"
 _DP_OVERRIDE_HEADER = "X-Routed-DP-Rank"
 _REQUEST_PRIORITY_HEADER = "X-Request-Priority"
 _DP_SERVER_INFO_TTL_SEC = 30
+_SGLANG_HEALTH_TTL_SEC = 10.0
 _INVALID_DP_RANK_RE = re.compile(r"routed_dp_rank.*out of range", re.IGNORECASE | re.DOTALL)
 _WHITESPACE_RE = re.compile(r"\s+")
 _CONFIG_RELOAD_INTERVAL_SEC = 1.0
@@ -788,6 +790,7 @@ def set_config(cfg: dict, *, source_path: str | None = None) -> None:
         _providers_by_model = grouped
         _available_models = tuple(sorted(grouped.keys()))
     _dp_size_cache.clear()
+    _sglang_health_cache.clear()
     _dp_allocators.clear()
     _model_allocators.clear()
     _runtime_metrics.reset()
@@ -924,6 +927,10 @@ def _providers_for_model(model: str) -> list[dict]:
     return providers
 
 
+def _sglang_generate_health_check_enabled(provider: dict) -> bool:
+    return bool(provider.get("sglang_generate_health_check"))
+
+
 def _resolve_request_model(requested_model: str | None, scenario: str = "default") -> str:
     requested = str(requested_model or "").strip()
     if not requested:
@@ -938,8 +945,20 @@ def _resolve_request_model(requested_model: str | None, scenario: str = "default
     raise HTTPException(400, f"Unknown model '{requested}'. Available models: {available}")
 
 
-def _select_deterministic_provider(model: str) -> ProviderTarget:
-    provider = _providers_for_model(model)[0]
+async def _healthy_providers_for_model(model: str, *, force_refresh: bool = False) -> list[dict]:
+    providers = _providers_for_model(model)
+    healthy: list[dict] = []
+    for provider in providers:
+        if await _is_provider_available(provider, force_refresh=force_refresh):
+            healthy.append(provider)
+    return healthy
+
+
+async def _select_deterministic_provider(model: str, *, force_refresh: bool = False) -> ProviderTarget:
+    providers = await _healthy_providers_for_model(model, force_refresh=force_refresh)
+    if not providers:
+        raise HTTPException(502, f"No healthy providers available for model '{model}'")
+    provider = providers[0]
     return ProviderTarget(provider=provider, model=model, url=provider["api_base_url"])
 
 
@@ -1005,7 +1024,9 @@ def _slot_loads_for_slots(slots: list[RoutingSlot]) -> dict[str, int]:
 
 
 async def _build_routing_slots(model: str, *, force_refresh: bool = False) -> list[RoutingSlot]:
-    providers = _providers_for_model(model)
+    providers = await _healthy_providers_for_model(model, force_refresh=force_refresh)
+    if not providers:
+        raise HTTPException(502, f"No healthy providers available for model '{model}'")
     provider_slot_rows: list[list[dict[str, Any]]] = []
     for provider in providers:
         provider_key = _dp_cache_key(provider)
@@ -1124,6 +1145,51 @@ def _sglang_metrics_urls(provider: dict) -> list[str]:
     root = _sglang_root_url(provider)
     urls = [f"{root}/metrics", f"{root}/metric"]
     return list(dict.fromkeys(urls))
+
+
+def _sglang_health_url(provider: dict) -> str:
+    return f"{_sglang_root_url(provider)}/health_generate"
+
+
+async def _check_sglang_health(provider: dict, *, force_refresh: bool = False) -> bool:
+    cache_key = _dp_cache_key(provider)
+    now = time.monotonic()
+    cached = _sglang_health_cache.get(cache_key)
+    # Enforce a hard minimum probe interval even when callers request refreshes.
+    if cached and now - float(cached["checked_at"]) < _SGLANG_HEALTH_TTL_SEC:
+        return bool(cached["healthy"])
+
+    client = get_shared_client()
+    timeout = _timeout()
+    healthy = False
+    try:
+        resp = await client.get(
+            _sglang_health_url(provider),
+            headers=_provider_headers(provider),
+            timeout=upstream_timeout(timeout),
+        )
+        healthy = resp.status_code < 400
+        if not healthy:
+            logger.warning(
+                "SGLang health check failed for %s: /health_generate returned %d",
+                provider.get("name"),
+                resp.status_code,
+            )
+    except Exception as exc:
+        logger.warning(
+            "SGLang health check failed for %s: /health_generate request error: %s",
+            provider.get("name"),
+            exc,
+        )
+
+    _sglang_health_cache[cache_key] = {"healthy": healthy, "checked_at": now}
+    return healthy
+
+
+async def _is_provider_available(provider: dict, *, force_refresh: bool = False) -> bool:
+    if not _sglang_generate_health_check_enabled(provider):
+        return True
+    return await _check_sglang_health(provider, force_refresh=force_refresh)
 
 
 def _dp_routing_config(provider: dict) -> dict | None:
@@ -1910,7 +1976,7 @@ async def count_tokens(request: Request):
 
     try:
         model = _resolve_request_model((body or {}).get("model"))
-        target = _select_deterministic_provider(model)
+        target = await _select_deterministic_provider(model)
         provider = target.provider
     except HTTPException:
         raise
@@ -1939,7 +2005,7 @@ async def tokens_clear(request: Request):
     """Proxy /tokens/clear to the upstream chat_to_generate_adapter."""
     body = await request.json()
     model = _resolve_routed_model()
-    provider = _select_deterministic_provider(model).provider
+    provider = (await _select_deterministic_provider(model)).provider
     api_base = _api_base(provider)
     # Strip /v1 (with or without trailing slash) to get the adapter root
     adapter_root = api_base.removesuffix("/v1").removesuffix("/")
@@ -1986,7 +2052,7 @@ async def list_models(before_id: str | None = None,
                       limit: int = 20):
     try:
         model = _resolve_routed_model()
-        provider = _select_deterministic_provider(model).provider
+        provider = (await _select_deterministic_provider(model)).provider
     except HTTPException:
         raise
 
@@ -2024,7 +2090,7 @@ async def list_models(before_id: str | None = None,
 async def get_model(model_id: str):
     try:
         model = _resolve_routed_model()
-        provider = _select_deterministic_provider(model).provider
+        provider = (await _select_deterministic_provider(model)).provider
     except HTTPException:
         raise
 
@@ -2090,7 +2156,7 @@ async def legacy_complete(request: Request):
 
     try:
         model = _resolve_request_model(body.get("model"))
-        target = _select_deterministic_provider(model)
+        target = await _select_deterministic_provider(model)
         provider = target.provider
         url = target.url
     except HTTPException:
@@ -2168,7 +2234,7 @@ async def create_batch(request: Request):
 
     try:
         model = _resolve_routed_model()
-        provider = _select_deterministic_provider(model).provider
+        provider = (await _select_deterministic_provider(model)).provider
     except HTTPException:
         raise
 
@@ -2220,7 +2286,7 @@ async def list_batches(request: Request,
                        limit: int = 20):
     try:
         model = _resolve_routed_model()
-        provider = _select_deterministic_provider(model).provider
+        provider = (await _select_deterministic_provider(model)).provider
     except HTTPException:
         raise
 
@@ -2255,7 +2321,7 @@ async def list_batches(request: Request,
 async def get_batch(batch_id: str, request: Request):
     try:
         model = _resolve_routed_model()
-        provider = _select_deterministic_provider(model).provider
+        provider = (await _select_deterministic_provider(model)).provider
     except HTTPException:
         raise
 
@@ -2277,7 +2343,7 @@ async def get_batch(batch_id: str, request: Request):
 async def cancel_batch(batch_id: str, request: Request):
     try:
         model = _resolve_routed_model()
-        provider = _select_deterministic_provider(model).provider
+        provider = (await _select_deterministic_provider(model)).provider
     except HTTPException:
         raise
 
@@ -2307,7 +2373,7 @@ async def cancel_batch(batch_id: str, request: Request):
 async def delete_batch(batch_id: str):
     try:
         model = _resolve_routed_model()
-        provider = _select_deterministic_provider(model).provider
+        provider = (await _select_deterministic_provider(model)).provider
     except HTTPException:
         raise
 
@@ -2330,7 +2396,7 @@ async def batch_results(batch_id: str, request: Request):
     """Stream batch results as Anthropic JSONL (one result per line)."""
     try:
         model = _resolve_routed_model()
-        provider = _select_deterministic_provider(model).provider
+        provider = (await _select_deterministic_provider(model)).provider
     except HTTPException:
         raise
 

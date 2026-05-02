@@ -81,6 +81,7 @@ class ProviderConfig(BaseModel):
     api_base_url: str
     api_key: str = ""
     max_retries: int = 3
+    sglang_generate_health_check: bool = False
     tokenizer_path: str | None = None
     params: ProviderParamsConfig | None = None
     dp_routing: DPRoutingConfig | None = None
