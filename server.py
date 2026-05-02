@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 _config: dict = {}
 _dp_size_cache: dict[str, dict[str, float | int]] = {}
 _sglang_health_cache: dict[str, dict[str, float | bool]] = {}
+_sglang_health_tasks: dict[str, asyncio.Task[None]] = {}
 _providers_by_model: dict[str, list[dict]] = {}
 _available_models: tuple[str, ...] = ()
 _config_path: str | None = None
@@ -60,7 +61,8 @@ _CLAUDE_SESSION_HEADER = "X-Claude-Code-Session-Id"
 _DP_OVERRIDE_HEADER = "X-Routed-DP-Rank"
 _REQUEST_PRIORITY_HEADER = "X-Request-Priority"
 _DP_SERVER_INFO_TTL_SEC = 30
-_SGLANG_HEALTH_TTL_SEC = 10.0
+_SGLANG_HEALTH_SUCCESS_TTL_SEC = 300.0
+_SGLANG_HEALTH_REFRESH_INTERVAL_SEC = 60.0
 _INVALID_DP_RANK_RE = re.compile(r"routed_dp_rank.*out of range", re.IGNORECASE | re.DOTALL)
 _WHITESPACE_RE = re.compile(r"\s+")
 _CONFIG_RELOAD_INTERVAL_SEC = 1.0
@@ -791,6 +793,9 @@ def set_config(cfg: dict, *, source_path: str | None = None) -> None:
         _available_models = tuple(sorted(grouped.keys()))
     _dp_size_cache.clear()
     _sglang_health_cache.clear()
+    for task in _sglang_health_tasks.values():
+        task.cancel()
+    _sglang_health_tasks.clear()
     _dp_allocators.clear()
     _model_allocators.clear()
     _runtime_metrics.reset()
@@ -1151,17 +1156,12 @@ def _sglang_health_url(provider: dict) -> str:
     return f"{_sglang_root_url(provider)}/health_generate"
 
 
-async def _check_sglang_health(provider: dict, *, force_refresh: bool = False) -> bool:
+async def _run_sglang_health_check(provider: dict) -> None:
     cache_key = _dp_cache_key(provider)
-    now = time.monotonic()
-    cached = _sglang_health_cache.get(cache_key)
-    # Enforce a hard minimum probe interval even when callers request refreshes.
-    if cached and now - float(cached["checked_at"]) < _SGLANG_HEALTH_TTL_SEC:
-        return bool(cached["healthy"])
-
     client = get_shared_client()
     timeout = _timeout()
     healthy = False
+    checked_at = time.monotonic()
     try:
         resp = await client.get(
             _sglang_health_url(provider),
@@ -1169,6 +1169,7 @@ async def _check_sglang_health(provider: dict, *, force_refresh: bool = False) -
             timeout=upstream_timeout(timeout),
         )
         healthy = resp.status_code < 400
+        checked_at = time.monotonic()
         if not healthy:
             logger.warning(
                 "SGLang health check failed for %s: /health_generate returned %d",
@@ -1176,20 +1177,51 @@ async def _check_sglang_health(provider: dict, *, force_refresh: bool = False) -
                 resp.status_code,
             )
     except Exception as exc:
+        checked_at = time.monotonic()
         logger.warning(
             "SGLang health check failed for %s: /health_generate request error: %s",
             provider.get("name"),
             exc,
         )
+    finally:
+        _sglang_health_tasks.pop(cache_key, None)
 
-    _sglang_health_cache[cache_key] = {"healthy": healthy, "checked_at": now}
-    return healthy
+    _sglang_health_cache[cache_key] = {"healthy": healthy, "checked_at": checked_at}
+
+
+def _ensure_sglang_health_check(provider: dict, *, force_refresh: bool = False) -> None:
+    cache_key = _dp_cache_key(provider)
+    task = _sglang_health_tasks.get(cache_key)
+    if task is not None and not task.done():
+        # A slow probe can take tens of seconds; never start a duplicate while one is in flight.
+        return
+    if task is not None and task.done():
+        _sglang_health_tasks.pop(cache_key, None)
+
+    now = time.monotonic()
+    cached = _sglang_health_cache.get(cache_key)
+    if not force_refresh and cached is not None:
+        checked_at = float(cached["checked_at"])
+        # Refresh cadence is measured from the last completed probe, not when it started.
+        if now - checked_at < _SGLANG_HEALTH_REFRESH_INTERVAL_SEC:
+            return
+
+    _sglang_health_tasks[cache_key] = asyncio.create_task(_run_sglang_health_check(provider))
+
+
+def _cached_sglang_health_is_fresh(provider: dict) -> bool:
+    cache_key = _dp_cache_key(provider)
+    cached = _sglang_health_cache.get(cache_key)
+    if cached is None or not bool(cached["healthy"]):
+        return False
+    return time.monotonic() - float(cached["checked_at"]) < _SGLANG_HEALTH_SUCCESS_TTL_SEC
 
 
 async def _is_provider_available(provider: dict, *, force_refresh: bool = False) -> bool:
     if not _sglang_generate_health_check_enabled(provider):
         return True
-    return await _check_sglang_health(provider, force_refresh=force_refresh)
+    _ensure_sglang_health_check(provider, force_refresh=force_refresh)
+    return _cached_sglang_health_is_fresh(provider)
 
 
 def _dp_routing_config(provider: dict) -> dict | None:

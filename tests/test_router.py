@@ -997,7 +997,7 @@ class TestSGLangHealthChecks(unittest.IsolatedAsyncioTestCase):
 
         srv_mod.set_config({})
 
-    async def test_health_check_is_cached_for_10_seconds_even_on_force_refresh(self):
+    async def test_health_check_runs_in_background_and_becomes_healthy_after_completion(self):
         import server as srv_mod
 
         srv_mod.set_config({
@@ -1027,35 +1027,33 @@ class TestSGLangHealthChecks(unittest.IsolatedAsyncioTestCase):
 
         fake_client = FakeClient()
         with patch.object(srv_mod, "get_shared_client", return_value=fake_client):
-            self.assertTrue(await srv_mod._check_sglang_health(provider))
-            self.assertTrue(await srv_mod._check_sglang_health(provider, force_refresh=True))
+            self.assertFalse(await srv_mod._is_provider_available(provider))
+            await asyncio.sleep(0)
+            self.assertTrue(await srv_mod._is_provider_available(provider))
 
         self.assertEqual(len(fake_client.calls), 1)
         self.assertEqual(fake_client.calls[0][0], "http://host:8000/health_generate")
 
-    async def test_select_deterministic_provider_skips_unhealthy_sglang_server(self):
+    async def test_cached_healthy_state_stays_available_and_refreshes_after_one_minute(self):
         import server as srv_mod
 
         srv_mod.set_config({
             "API_TIMEOUT_MS": 60000,
-            "Providers": [
-                {
-                    "name": "backend-a",
-                    "model": "/model",
-                    "api_base_url": "http://bad:8000/v1/chat/completions",
-                    "api_key": "k1",
-                    "sglang_generate_health_check": True,
-                },
-                {
-                    "name": "backend-b",
-                    "model": "/model",
-                    "api_base_url": "http://good:8000/v1/chat/completions",
-                    "api_key": "k2",
-                    "sglang_generate_health_check": True,
-                },
-            ],
+            "Providers": [{
+                "name": "backend-a",
+                "model": "/model",
+                "api_base_url": "http://host:8000/v1/chat/completions",
+                "api_key": "k",
+                "sglang_generate_health_check": True,
+            }],
             "Router": {"default": "/model"},
         })
+        provider = srv_mod.get_provider(srv_mod._config, "backend-a")
+        cache_key = srv_mod._dp_cache_key(provider)
+        srv_mod._sglang_health_cache[cache_key] = {
+            "healthy": True,
+            "checked_at": srv_mod.time.monotonic() - 61.0,
+        }
 
         class FakeClient:
             def __init__(self):
@@ -1063,20 +1061,72 @@ class TestSGLangHealthChecks(unittest.IsolatedAsyncioTestCase):
 
             async def get(self, url, headers=None, timeout=None, **kwargs):
                 self.calls.append(url)
-                if url == "http://bad:8000/health_generate":
-                    return httpx.Response(503, text="down", request=httpx.Request("GET", url))
-                if url == "http://good:8000/health_generate":
-                    return httpx.Response(200, json={"status": "ok"}, request=httpx.Request("GET", url))
-                raise AssertionError(f"unexpected url {url}")
+                return httpx.Response(200, json={"status": "ok"}, request=httpx.Request("GET", url))
 
         fake_client = FakeClient()
         with patch.object(srv_mod, "get_shared_client", return_value=fake_client):
-            target = await srv_mod._select_deterministic_provider("/model")
+            self.assertTrue(await srv_mod._is_provider_available(provider))
+            self.assertEqual(fake_client.calls, [])
+            await asyncio.sleep(0)
+            self.assertTrue(await srv_mod._is_provider_available(provider))
 
-        self.assertEqual(target.provider["name"], "backend-b")
+        self.assertEqual(fake_client.calls, ["http://host:8000/health_generate"])
+
+    async def test_slow_health_check_is_non_blocking_and_deduplicated(self):
+        import server as srv_mod
+
+        srv_mod.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [{
+                "name": "backend-a",
+                "model": "/model",
+                "api_base_url": "http://host:8000/v1/chat/completions",
+                "api_key": "k",
+                "sglang_generate_health_check": True,
+            }],
+            "Router": {"default": "/model"},
+        })
+        provider = srv_mod.get_provider(srv_mod._config, "backend-a")
+        cache_key = srv_mod._dp_cache_key(provider)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def get(self, url, headers=None, timeout=None, **kwargs):
+                self.calls.append(url)
+                started.set()
+                await release.wait()
+                return httpx.Response(200, json={"status": "ok"}, request=httpx.Request("GET", url))
+
+        fake_client = FakeClient()
+        with patch.object(srv_mod, "get_shared_client", return_value=fake_client):
+            self.assertFalse(await srv_mod._is_provider_available(provider))
+            await started.wait()
+            first_task = srv_mod._sglang_health_tasks[cache_key]
+            self.assertFalse(await srv_mod._is_provider_available(provider))
+            self.assertIs(srv_mod._sglang_health_tasks[cache_key], first_task)
+            self.assertEqual(fake_client.calls, ["http://host:8000/health_generate"])
+
+            release.set()
+            await asyncio.sleep(0)
+            self.assertTrue(await srv_mod._is_provider_available(provider))
+
+            checked_at = float(srv_mod._sglang_health_cache[cache_key]["checked_at"])
+            srv_mod._sglang_health_cache[cache_key]["checked_at"] = checked_at - 59.0
+            self.assertTrue(await srv_mod._is_provider_available(provider))
+            await asyncio.sleep(0)
+            self.assertEqual(fake_client.calls, ["http://host:8000/health_generate"])
+
+            srv_mod._sglang_health_cache[cache_key]["checked_at"] = checked_at - 61.0
+            self.assertTrue(await srv_mod._is_provider_available(provider))
+            await asyncio.sleep(0)
+
         self.assertEqual(
             fake_client.calls,
-            ["http://bad:8000/health_generate", "http://good:8000/health_generate"],
+            ["http://host:8000/health_generate", "http://host:8000/health_generate"],
         )
 
     async def test_select_deterministic_provider_does_not_probe_without_flag(self):
@@ -1114,6 +1164,56 @@ class TestSGLangHealthChecks(unittest.IsolatedAsyncioTestCase):
             target = await srv_mod._select_deterministic_provider("/model")
 
         self.assertEqual(target.provider["name"], "backend-a")
+        self.assertEqual(fake_client.calls, [])
+
+    async def test_select_deterministic_provider_skips_unhealthy_cached_server(self):
+        import server as srv_mod
+
+        srv_mod.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [
+                {
+                    "name": "backend-a",
+                    "model": "/model",
+                    "api_base_url": "http://bad:8000/v1/chat/completions",
+                    "api_key": "k1",
+                    "sglang_generate_health_check": True,
+                },
+                {
+                    "name": "backend-b",
+                    "model": "/model",
+                    "api_base_url": "http://good:8000/v1/chat/completions",
+                    "api_key": "k2",
+                    "sglang_generate_health_check": True,
+                },
+            ],
+            "Router": {"default": "/model"},
+        })
+
+        bad = srv_mod.get_provider(srv_mod._config, "backend-a")
+        good = srv_mod.get_provider(srv_mod._config, "backend-b")
+        srv_mod._sglang_health_cache[srv_mod._dp_cache_key(bad)] = {
+            "healthy": False,
+            "checked_at": srv_mod.time.monotonic(),
+        }
+        srv_mod._sglang_health_cache[srv_mod._dp_cache_key(good)] = {
+            "healthy": True,
+            "checked_at": srv_mod.time.monotonic(),
+        }
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def get(self, url, headers=None, timeout=None, **kwargs):
+                self.calls.append(url)
+                raise AssertionError(f"unexpected health check {url}")
+
+        fake_client = FakeClient()
+        with patch.object(srv_mod, "get_shared_client", return_value=fake_client):
+            target = await srv_mod._select_deterministic_provider("/model")
+
+        self.assertEqual(target.provider["name"], "backend-b")
         self.assertEqual(fake_client.calls, [])
 
 
