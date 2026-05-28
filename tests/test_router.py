@@ -977,6 +977,44 @@ class TestTokenCounting(unittest.TestCase):
         self.assertEqual(tok.encoded, "templated prompt")
         self.assertEqual(tok.tools, req["tools"])
 
+    def test_count_tokens_normalizes_tool_call_arguments_for_chat_template(self):
+        import server as srv_mod
+
+        class FakeTokenizer:
+            def __init__(self):
+                self.arguments = None
+
+            def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, tools=None):
+                self.arguments = messages[0]["tool_calls"][0]["arguments"]
+                # Reproduce the GLM template expectation that arguments is a dict.
+                list(self.arguments.items())
+                return "templated prompt"
+
+            def encode(self, text):
+                return list(range(len(text)))
+
+        tok = FakeTokenizer()
+        req = {
+            "messages": [{
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "arguments": "{\"query\":\"python\"}",
+                    },
+                }],
+            }],
+        }
+
+        with patch.object(srv_mod, "_get_tokenizer", return_value=tok):
+            count = srv_mod._count_tokens_in_openai_req(req, "/models/tokenizer")
+
+        self.assertEqual(count, len("templated prompt"))
+        self.assertEqual(tok.arguments, {"query": "python"})
+
     def test_resolve_tokenizer_path_falls_back_to_environment(self):
         import server as srv_mod
 

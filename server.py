@@ -1639,6 +1639,48 @@ def _extract_text_for_counting(req: dict) -> str:
     return "\n".join(parts)
 
 
+def _normalize_messages_for_chat_template(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Match tokenizer chat-template expectations for tool-call arguments."""
+    normalized_messages: list[dict[str, Any]] = []
+    for msg in messages:
+        normalized_msg = dict(msg)
+        tool_calls = msg.get("tool_calls")
+        if not isinstance(tool_calls, list) or not tool_calls:
+            normalized_messages.append(normalized_msg)
+            continue
+
+        normalized_tool_calls = []
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+            name = fn.get("name", "")
+            args = fn.get("arguments")
+
+            if args is None:
+                arguments = {}
+            elif isinstance(args, str):
+                raw = args.strip()
+                if not raw:
+                    arguments = {}
+                else:
+                    try:
+                        loaded = json.loads(raw)
+                        arguments = loaded if isinstance(loaded, dict) else {"_": loaded}
+                    except Exception:
+                        arguments = {"_raw": args}
+            else:
+                arguments = args if isinstance(args, dict) else {}
+
+            normalized_tool_calls.append({"name": name, "arguments": arguments})
+
+        normalized_msg["tool_calls"] = normalized_tool_calls
+        normalized_messages.append(normalized_msg)
+
+    return normalized_messages
+
+
 def _count_tokens_in_openai_req(req: dict, tokenizer_path: str) -> int:
     tok = _get_tokenizer(tokenizer_path)
     text: str | None = None
@@ -1653,7 +1695,7 @@ def _count_tokens_in_openai_req(req: dict, tokenizer_path: str) -> int:
             sig = inspect.signature(apply_chat_template)
             if "tools" in sig.parameters and req.get("tools"):
                 kwargs["tools"] = req["tools"]
-            text = apply_chat_template(req.get("messages", []), **kwargs)
+            text = apply_chat_template(_normalize_messages_for_chat_template(req.get("messages", [])), **kwargs)
         except Exception:
             logger.debug("Falling back to flattened text token counting", exc_info=True)
 
