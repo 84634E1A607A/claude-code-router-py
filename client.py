@@ -9,7 +9,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
-_CONNECT_TIMEOUT_SEC = 3.0
+_CONNECT_TIMEOUT_SEC = 1.0
 _MAX_CONNECT_RETRY_DELAY_SEC = 60.0
 
 # Shared HTTP client for non-streaming requests (connection pooling)

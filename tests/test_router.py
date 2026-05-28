@@ -622,7 +622,7 @@ class TestUpstreamTimeout(unittest.TestCase):
 
         timeout = upstream_timeout(120.0)
 
-        self.assertEqual(timeout.connect, 3.0)
+        self.assertEqual(timeout.connect, 1.0)
         self.assertEqual(timeout.read, 120.0)
         self.assertEqual(timeout.write, 120.0)
         self.assertEqual(timeout.pool, 120.0)
@@ -997,7 +997,7 @@ class TestSGLangHealthChecks(unittest.IsolatedAsyncioTestCase):
 
         srv_mod.set_config({})
 
-    async def test_health_check_runs_in_background_and_becomes_healthy_after_completion(self):
+    async def test_health_check_runs_in_background_and_provider_is_available_while_cold(self):
         import server as srv_mod
 
         srv_mod.set_config({
@@ -1027,7 +1027,7 @@ class TestSGLangHealthChecks(unittest.IsolatedAsyncioTestCase):
 
         fake_client = FakeClient()
         with patch.object(srv_mod, "get_shared_client", return_value=fake_client):
-            self.assertFalse(await srv_mod._is_provider_available(provider))
+            self.assertTrue(await srv_mod._is_provider_available(provider))
             await asyncio.sleep(0)
             self.assertTrue(await srv_mod._is_provider_available(provider))
 
@@ -1103,10 +1103,10 @@ class TestSGLangHealthChecks(unittest.IsolatedAsyncioTestCase):
 
         fake_client = FakeClient()
         with patch.object(srv_mod, "get_shared_client", return_value=fake_client):
-            self.assertFalse(await srv_mod._is_provider_available(provider))
+            self.assertTrue(await srv_mod._is_provider_available(provider))
             await started.wait()
             first_task = srv_mod._sglang_health_tasks[cache_key]
-            self.assertFalse(await srv_mod._is_provider_available(provider))
+            self.assertTrue(await srv_mod._is_provider_available(provider))
             self.assertIs(srv_mod._sglang_health_tasks[cache_key], first_task)
             self.assertEqual(fake_client.calls, ["http://host:8000/health_generate"])
 
@@ -1127,6 +1127,51 @@ class TestSGLangHealthChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             fake_client.calls,
             ["http://host:8000/health_generate", "http://host:8000/health_generate"],
+        )
+
+    async def test_build_routing_slots_includes_all_cold_health_checked_providers(self):
+        import server as srv_mod
+
+        srv_mod.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [
+                {
+                    "name": "backend-a",
+                    "model": "/model",
+                    "api_base_url": "http://a:8000/v1/chat/completions",
+                    "api_key": "k1",
+                    "sglang_generate_health_check": True,
+                },
+                {
+                    "name": "backend-b",
+                    "model": "/model",
+                    "api_base_url": "http://b:8000/v1/chat/completions",
+                    "api_key": "k2",
+                    "sglang_generate_health_check": True,
+                },
+            ],
+            "Router": {"default": "/model"},
+        })
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def get(self, url, headers=None, timeout=None, **kwargs):
+                self.calls.append(url)
+                return httpx.Response(200, json={"status": "ok"}, request=httpx.Request("GET", url))
+
+        fake_client = FakeClient()
+        with patch.object(srv_mod, "get_shared_client", return_value=fake_client):
+            slots = await srv_mod._build_routing_slots("/model")
+            tasks = list(srv_mod._sglang_health_tasks.values())
+            if tasks:
+                await asyncio.gather(*tasks)
+
+        self.assertEqual([slot.provider_name for slot in slots], ["backend-a", "backend-b"])
+        self.assertEqual(
+            fake_client.calls,
+            ["http://a:8000/health_generate", "http://b:8000/health_generate"],
         )
 
     async def test_select_deterministic_provider_does_not_probe_without_flag(self):
@@ -1215,6 +1260,83 @@ class TestSGLangHealthChecks(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(target.provider["name"], "backend-b")
         self.assertEqual(fake_client.calls, [])
+
+    async def test_retryable_completion_failure_does_not_mark_provider_unhealthy(self):
+        import server as srv_mod
+
+        srv_mod.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [
+                {
+                    "name": "backend-a",
+                    "model": "/model",
+                    "api_base_url": "http://bad:8000/v1/chat/completions",
+                    "api_key": "k1",
+                    "max_retries": 0,
+                    "sglang_generate_health_check": True,
+                },
+                {
+                    "name": "backend-b",
+                    "model": "/model",
+                    "api_base_url": "http://good:8000/v1/chat/completions",
+                    "api_key": "k2",
+                    "max_retries": 0,
+                    "sglang_generate_health_check": True,
+                },
+            ],
+            "Router": {"default": "/model"},
+        })
+        for provider in srv_mod._config["Providers"]:
+            srv_mod._sglang_health_cache[srv_mod._dp_cache_key(provider)] = {
+                "healthy": True,
+                "checked_at": srv_mod.time.monotonic(),
+            }
+
+        from httpx import ASGITransport, AsyncClient
+        client = AsyncClient(
+            transport=ASGITransport(app=srv_mod.app),
+            base_url="http://test",
+            timeout=60.0,
+        )
+
+        sent_urls = []
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_urls.append(url)
+            if url == "http://bad:8000/v1/chat/completions":
+                raise srv_mod.ProviderError(500, "offline")
+            return {
+                "id": "chatcmpl-test",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "PONG"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1},
+            }
+
+        try:
+            with patch.object(srv_mod, "_count_request_input_tokens", new=AsyncMock(return_value=(0, None))), \
+                 patch.object(srv_mod, "post_json", new=AsyncMock(side_effect=fake_post)):
+                resp = await client.post(
+                    "/v1/messages",
+                    json={
+                        "model": "default",
+                        "max_tokens": 64,
+                        "messages": [{"role": "user", "content": "Reply with exactly: PONG"}],
+                    },
+                    headers={srv_mod._CLAUDE_SESSION_HEADER: "health-cache-session"},
+                )
+        finally:
+            await client.aclose()
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(sent_urls, [
+            "http://bad:8000/v1/chat/completions",
+            "http://good:8000/v1/chat/completions",
+        ])
+        provider = srv_mod.get_provider(srv_mod._config, "backend-a")
+        self.assertTrue(srv_mod._sglang_health_cache[srv_mod._dp_cache_key(provider)]["healthy"])
 
 
 class TestDPRoutingStickyKeys(unittest.TestCase):
@@ -2250,6 +2372,213 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent_bodies[0]["routed_dp_rank"], 1)
         self.assertEqual(resp.headers["X-Router-DP-Rank"], "1")
         self.assertEqual(allocator.sessions[session_id], self.srv._provider_slot_id(provider, 1))
+
+    async def test_reassigns_sticky_session_to_idle_provider_when_current_slot_has_multiple_active(self):
+        sent_urls = []
+        self.srv.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [
+                {
+                    "name": "first",
+                    "model": "/model",
+                    "api_base_url": "http://first:8000/v1/chat/completions",
+                    "api_key": "k1",
+                    "max_retries": 1,
+                },
+                {
+                    "name": "second",
+                    "model": "/model",
+                    "api_base_url": "http://second:8000/v1/chat/completions",
+                    "api_key": "k2",
+                    "max_retries": 1,
+                },
+            ],
+            "Router": {"default": "/model"},
+        })
+        session_id = "hot-provider-session"
+        slots = await self.srv._build_routing_slots("/model")
+        allocator = self.srv._get_or_create_model_allocator("/model", slots)
+        allocator.assign(session_id)
+        first = self.srv.get_provider(self.srv._config, "first")
+        first_key = self.srv._dp_cache_key(first)
+        ctx_one = self.srv._runtime_metrics.start_request(first_key, "first", None, False)
+        ctx_two = self.srv._runtime_metrics.start_request(first_key, "first", None, False)
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_urls.append(url)
+            return self._openai_resp()
+
+        try:
+            with patch.object(self.srv, "_count_request_input_tokens", new=AsyncMock(return_value=(0, None))), \
+                 patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+                resp = await self.client.post(
+                    "/v1/messages",
+                    json=self._messages_req(),
+                    headers={self.srv._CLAUDE_SESSION_HEADER: session_id},
+                )
+        finally:
+            self.srv._runtime_metrics.finish_request(ctx_one, success=False)
+            self.srv._runtime_metrics.finish_request(ctx_two, success=False)
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(sent_urls, ["http://second:8000/v1/chat/completions"])
+        self.assertEqual(resp.headers["X-Router-Provider"], "second")
+        second = self.srv.get_provider(self.srv._config, "second")
+        self.assertEqual(allocator.sessions[session_id], self.srv._provider_slot_id(second, None))
+
+    async def test_does_not_reassign_sticky_session_when_current_slot_has_one_active(self):
+        sent_urls = []
+        self.srv.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [
+                {
+                    "name": "first",
+                    "model": "/model",
+                    "api_base_url": "http://first:8000/v1/chat/completions",
+                    "api_key": "k1",
+                    "max_retries": 1,
+                },
+                {
+                    "name": "second",
+                    "model": "/model",
+                    "api_base_url": "http://second:8000/v1/chat/completions",
+                    "api_key": "k2",
+                    "max_retries": 1,
+                },
+            ],
+            "Router": {"default": "/model"},
+        })
+        session_id = "warm-provider-session"
+        slots = await self.srv._build_routing_slots("/model")
+        allocator = self.srv._get_or_create_model_allocator("/model", slots)
+        allocator.assign(session_id)
+        first = self.srv.get_provider(self.srv._config, "first")
+        first_key = self.srv._dp_cache_key(first)
+        ctx = self.srv._runtime_metrics.start_request(first_key, "first", None, False)
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_urls.append(url)
+            return self._openai_resp()
+
+        try:
+            with patch.object(self.srv, "_count_request_input_tokens", new=AsyncMock(return_value=(0, None))), \
+                 patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+                resp = await self.client.post(
+                    "/v1/messages",
+                    json=self._messages_req(),
+                    headers={self.srv._CLAUDE_SESSION_HEADER: session_id},
+                )
+        finally:
+            self.srv._runtime_metrics.finish_request(ctx, success=False)
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(sent_urls, ["http://first:8000/v1/chat/completions"])
+        self.assertEqual(resp.headers["X-Router-Provider"], "first")
+        self.assertEqual(allocator.sessions[session_id], self.srv._provider_slot_id(first, None))
+
+    async def test_does_not_reassign_sticky_session_when_no_provider_slot_is_idle(self):
+        sent_urls = []
+        self.srv.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [
+                {
+                    "name": "first",
+                    "model": "/model",
+                    "api_base_url": "http://first:8000/v1/chat/completions",
+                    "api_key": "k1",
+                    "max_retries": 1,
+                },
+                {
+                    "name": "second",
+                    "model": "/model",
+                    "api_base_url": "http://second:8000/v1/chat/completions",
+                    "api_key": "k2",
+                    "max_retries": 1,
+                },
+            ],
+            "Router": {"default": "/model"},
+        })
+        session_id = "no-idle-provider-session"
+        slots = await self.srv._build_routing_slots("/model")
+        allocator = self.srv._get_or_create_model_allocator("/model", slots)
+        allocator.assign(session_id)
+        first = self.srv.get_provider(self.srv._config, "first")
+        second = self.srv.get_provider(self.srv._config, "second")
+        first_key = self.srv._dp_cache_key(first)
+        second_key = self.srv._dp_cache_key(second)
+        contexts = [
+            self.srv._runtime_metrics.start_request(first_key, "first", None, False),
+            self.srv._runtime_metrics.start_request(first_key, "first", None, False),
+            self.srv._runtime_metrics.start_request(second_key, "second", None, False),
+        ]
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_urls.append(url)
+            return self._openai_resp()
+
+        try:
+            with patch.object(self.srv, "_count_request_input_tokens", new=AsyncMock(return_value=(0, None))), \
+                 patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+                resp = await self.client.post(
+                    "/v1/messages",
+                    json=self._messages_req(),
+                    headers={self.srv._CLAUDE_SESSION_HEADER: session_id},
+                )
+        finally:
+            for ctx in contexts:
+                self.srv._runtime_metrics.finish_request(ctx, success=False)
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(sent_urls, ["http://first:8000/v1/chat/completions"])
+        self.assertEqual(resp.headers["X-Router-Provider"], "first")
+        self.assertEqual(allocator.sessions[session_id], self.srv._provider_slot_id(first, None))
+
+    async def test_override_header_is_not_reassigned_from_busy_provider(self):
+        sent_urls = []
+        self.srv.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "Providers": [
+                {
+                    "name": "first",
+                    "model": "/model",
+                    "api_base_url": "http://first:8000/v1/chat/completions",
+                    "api_key": "k1",
+                    "max_retries": 1,
+                },
+                {
+                    "name": "second",
+                    "model": "/model",
+                    "api_base_url": "http://second:8000/v1/chat/completions",
+                    "api_key": "k2",
+                    "max_retries": 1,
+                },
+            ],
+            "Router": {"default": "/model"},
+        })
+        first = self.srv.get_provider(self.srv._config, "first")
+        first_key = self.srv._dp_cache_key(first)
+        ctx_one = self.srv._runtime_metrics.start_request(first_key, "first", None, False)
+        ctx_two = self.srv._runtime_metrics.start_request(first_key, "first", None, False)
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_urls.append(url)
+            return self._openai_resp()
+
+        try:
+            with patch.object(self.srv, "_count_request_input_tokens", new=AsyncMock(return_value=(0, None))), \
+                 patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+                resp = await self.client.post(
+                    "/v1/messages",
+                    json=self._messages_req(),
+                    headers={self.srv._DP_OVERRIDE_HEADER: "0"},
+                )
+        finally:
+            self.srv._runtime_metrics.finish_request(ctx_one, success=False)
+            self.srv._runtime_metrics.finish_request(ctx_two, success=False)
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(sent_urls, ["http://first:8000/v1/chat/completions"])
+        self.assertEqual(resp.headers["X-Router-Provider"], "first")
 
     async def test_invalid_rank_retries_once_with_refreshed_dp_size(self):
         """Test that when dp_size shrinks and stored rank becomes invalid, retry works."""

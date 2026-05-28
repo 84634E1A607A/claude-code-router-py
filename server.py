@@ -61,7 +61,6 @@ _CLAUDE_SESSION_HEADER = "X-Claude-Code-Session-Id"
 _DP_OVERRIDE_HEADER = "X-Routed-DP-Rank"
 _REQUEST_PRIORITY_HEADER = "X-Request-Priority"
 _DP_SERVER_INFO_TTL_SEC = 30
-_SGLANG_HEALTH_SUCCESS_TTL_SEC = 300.0
 _SGLANG_HEALTH_REFRESH_INTERVAL_SEC = 60.0
 _INVALID_DP_RANK_RE = re.compile(r"routed_dp_rank.*out of range", re.IGNORECASE | re.DOTALL)
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -100,7 +99,7 @@ class StickySlotAllocator:
     """Manages sticky session-to-slot mapping with round-robin allocation.
 
     Key properties:
-    - Sessions are sticky forever (once assigned, never reassigned)
+    - Sessions are sticky unless load balancing explicitly reassigns them
     - Multiple sessions can share the same slot
     - New sessions get the slot with the fewest active requests, breaking ties by longest idle time
     - Sessions evicted after TTL of inactivity
@@ -1209,19 +1208,29 @@ def _ensure_sglang_health_check(provider: dict, *, force_refresh: bool = False) 
     _sglang_health_tasks[cache_key] = asyncio.create_task(_run_sglang_health_check(provider))
 
 
-def _cached_sglang_health_is_fresh(provider: dict) -> bool:
+def _cached_sglang_health_is_available(provider: dict) -> bool:
     cache_key = _dp_cache_key(provider)
     cached = _sglang_health_cache.get(cache_key)
-    if cached is None or not bool(cached["healthy"]):
+    if cached is None:
+        logger.debug(
+            "SGLang health unknown for %s; routing optimistically while probe runs",
+            provider.get("name"),
+        )
+        return True
+    if not bool(cached["healthy"]):
+        logger.debug(
+            "SGLang health cache excludes %s until a successful probe",
+            provider.get("name"),
+        )
         return False
-    return time.monotonic() - float(cached["checked_at"]) < _SGLANG_HEALTH_SUCCESS_TTL_SEC
+    return True
 
 
 async def _is_provider_available(provider: dict, *, force_refresh: bool = False) -> bool:
     if not _sglang_generate_health_check_enabled(provider):
         return True
     _ensure_sglang_health_check(provider, force_refresh=force_refresh)
-    return _cached_sglang_health_is_fresh(provider)
+    return _cached_sglang_health_is_available(provider)
 
 
 def _dp_routing_config(provider: dict) -> dict | None:
@@ -1363,47 +1372,43 @@ def _log_dp_routing(provider: dict, decision: DPRoutingDecision, remapped: bool 
     )
 
 
-def _maybe_reassign_dp_slot(
+def _maybe_reassign_busy_slot(
     allocator: StickySlotAllocator,
     sticky_key: str,
     selected_slot: RoutingSlot,
     slot_by_id: dict[str, RoutingSlot],
+    slot_loads: dict[str, int],
 ) -> tuple[RoutingSlot, bool]:
-    current_rank = selected_slot.provider_dp_rank
-    dp_size = selected_slot.dp_size
-    if current_rank is None or not dp_size or dp_size <= 1:
+    current_active = int(slot_loads.get(selected_slot.slot_id, 0))
+    if current_active <= 1:
         return selected_slot, False
 
-    active_requests = _runtime_metrics.provider_dp_active_requests(selected_slot.provider_key, dp_size)
-    current_active = int(active_requests.get(current_rank, 0))
-    current_slot_id = _provider_slot_id(selected_slot.provider, current_rank)
+    idle_candidates = [
+        slot for slot in slot_by_id.values()
+        if slot.slot_id != selected_slot.slot_id and int(slot_loads.get(slot.slot_id, 0)) == 0
+    ]
+    if not idle_candidates:
+        return selected_slot, False
 
-    best_candidate: RoutingSlot | None = None
-    best_score: tuple[int, float, int] | None = None
-    for candidate_rank in range(dp_size):
-        candidate_slot_id = _provider_slot_id(selected_slot.provider, candidate_rank)
-        candidate_slot = slot_by_id.get(candidate_slot_id)
-        if candidate_slot is None:
-            continue
-        candidate_active = int(active_requests.get(candidate_rank, 0))
-        if candidate_active >= current_active:
-            continue
-        score = (candidate_active, allocator.slot_last_used.get(candidate_slot_id, 0.0), candidate_rank)
-        if best_score is None or score < best_score:
-            best_score = score
-            best_candidate = candidate_slot
-
-    if best_candidate is None or best_candidate.slot_id == current_slot_id:
+    best_candidate = min(
+        idle_candidates,
+        key=lambda slot: (allocator.slot_last_used.get(slot.slot_id, 0.0), slot.flat_index),
+    )
+    if best_candidate.slot_id == selected_slot.slot_id:
         return selected_slot, False
 
     if allocator.reassign(sticky_key, best_candidate.slot_id):
         logger.info(
-            "DP reassign provider=%s sticky_key=%s from_rank=%d to_rank=%d active_requests=%s",
-            selected_slot.provider_name,
+            "Routing reassign sticky_key=%s from_provider=%s from_slot=%d from_provider_dp_rank=%s "
+            "to_provider=%s to_slot=%d to_provider_dp_rank=%s slot_loads=%s",
             sticky_key,
-            current_rank,
+            selected_slot.provider_name,
+            selected_slot.flat_index,
+            selected_slot.provider_dp_rank,
+            best_candidate.provider_name,
+            best_candidate.flat_index,
             best_candidate.provider_dp_rank,
-            active_requests,
+            slot_loads,
         )
         return best_candidate, True
 
@@ -1459,7 +1464,13 @@ async def _resolve_dp_routing(
         allocator.session_activity.pop(sticky_key, None)
         slot_id, is_new = allocator.assign(sticky_key, slot_loads=slot_loads)
         selected_slot = slot_by_id[slot_id]
-    selected_slot, remapped = _maybe_reassign_dp_slot(allocator, sticky_key, selected_slot, slot_by_id)
+    selected_slot, remapped = _maybe_reassign_busy_slot(
+        allocator,
+        sticky_key,
+        selected_slot,
+        slot_by_id,
+        slot_loads,
+    )
 
     if selected_slot.provider_dp_rank is not None:
         openai_req["routed_dp_rank"] = selected_slot.provider_dp_rank
@@ -1565,7 +1576,13 @@ async def _resolve_retry_routing(
         )
         allocator.reassign(sticky_key, selected_slot.slot_id)
 
-    selected_slot, remapped = _maybe_reassign_dp_slot(allocator, sticky_key, selected_slot, slot_by_id)
+    selected_slot, remapped = _maybe_reassign_busy_slot(
+        allocator,
+        sticky_key,
+        selected_slot,
+        slot_by_id,
+        slot_loads,
+    )
 
     if selected_slot.provider_dp_rank is not None:
         openai_req["routed_dp_rank"] = selected_slot.provider_dp_rank
