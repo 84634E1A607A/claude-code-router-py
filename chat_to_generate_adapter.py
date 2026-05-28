@@ -1,10 +1,11 @@
 import asyncio
+from copy import deepcopy
 import json
 import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import httpx
 import orjson
@@ -13,8 +14,6 @@ from fastapi.responses import StreamingResponse
 from transformers import AutoTokenizer
 import re
 from client import ProviderError, ProviderStream, open_provider_stream
-
-from typing import Iterable
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -222,9 +221,9 @@ class ChatToGenerateAdapter:
         if use_generate_api or use_completions_for_chat:
             if not tokenizer_path:
                 raise ValueError("TOKENIZER_PATH is required when generate/completions adaptation is enabled")
-            print(f"Loading tokenizer from {tokenizer_path}")
+            logger.info("Loading tokenizer from %s", tokenizer_path)
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
-            print("Tokenizer loaded successfully")
+            logger.info("Tokenizer loaded successfully")
 
     async def get_http_client(self) -> httpx.AsyncClient:
         """Get or create async HTTP client"""
@@ -252,11 +251,15 @@ class ChatToGenerateAdapter:
         iterate via `.items()`. OpenAI-style requests usually carry `function.arguments`
         as a JSON *string*, so we parse it into a dict here.
         """
+        normalized_messages = []
         for msg in messages:
+            normalized_msg = dict(msg)
             tool_calls = msg.get("tool_calls")
             if not tool_calls:
+                normalized_messages.append(normalized_msg)
                 continue
             if not isinstance(tool_calls, list):
+                normalized_messages.append(normalized_msg)
                 continue
 
             normalized_tool_calls = []
@@ -289,8 +292,9 @@ class ChatToGenerateAdapter:
 
                 normalized_tool_calls.append({"name": name, "arguments": arguments})
 
-            msg["tool_calls"] = normalized_tool_calls
-        return messages
+            normalized_msg["tool_calls"] = normalized_tool_calls
+            normalized_messages.append(normalized_msg)
+        return normalized_messages
 
     def _convert_messages_to_prompt(self, messages: List[Dict[str, Any]]) -> str:
         """
@@ -324,7 +328,7 @@ class ChatToGenerateAdapter:
         """Prefer explicit main_key, then derive it from metadata.user_id/session_id-bearing user fields."""
         main_key = chat_request.get("main_key")
         if main_key is not None:
-            print(f"[main_key] resolved from request.main_key: {main_key}")
+            logger.debug("Resolved main_key from request.main_key: %s", main_key)
             return main_key
 
         metadata = chat_request.get("metadata")
@@ -334,7 +338,7 @@ class ChatToGenerateAdapter:
                 session_id = user_id.get("session_id")
                 if session_id is not None:
                     resolved = str(session_id)
-                    print(f"[main_key] resolved from metadata.user_id.session_id: {resolved}")
+                    logger.debug("Resolved main_key from metadata.user_id.session_id: %s", resolved)
                     return resolved
 
         user = chat_request.get("user")
@@ -342,7 +346,7 @@ class ChatToGenerateAdapter:
             session_id = user.get("session_id")
             if session_id is not None:
                 resolved = str(session_id)
-                print(f"[main_key] resolved from request.user.session_id: {resolved}")
+                logger.debug("Resolved main_key from request.user.session_id: %s", resolved)
                 return resolved
         elif isinstance(user, str):
             raw = user.strip()
@@ -355,10 +359,10 @@ class ChatToGenerateAdapter:
                     session_id = parsed_user.get("session_id")
                     if session_id is not None:
                         resolved = str(session_id)
-                        print(f"[main_key] resolved from request.user JSON session_id: {resolved}")
+                        logger.debug("Resolved main_key from request.user JSON session_id: %s", resolved)
                         return resolved
 
-        print("[main_key] not found: no session_id in metadata.user_id or request.user")
+        logger.debug("No main_key found in request metadata or user payload")
         return None
 
     def _build_generate_request(self, chat_request: Dict[str, Any]) -> Dict[str, Any]:
@@ -371,7 +375,7 @@ class ChatToGenerateAdapter:
         Returns:
             Request for generate API
         """
-        messages = chat_request.get("messages", [])
+        messages = deepcopy(chat_request.get("messages", []))
         tools = chat_request.get("tools", [])
         if tools:
             tools_system_prompt = self._build_glm47_tools_prompt(tools)
@@ -392,8 +396,6 @@ class ChatToGenerateAdapter:
             raise RuntimeError("Tokenizer not loaded. Set use_generate_api=True in __init__")
 
         messages = self._normalize_messages_for_chat_template(messages)
-
-        normalized_data = {"messages": messages, "tools": tools if tools else None}
         prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
         # Build generate request
@@ -466,6 +468,8 @@ class ChatToGenerateAdapter:
         # Combine reasoning and content into message content
         message_content = parsed_response.get("content", "")
         reasoning_content = parsed_response.get("reasoning_content", "")
+        raw_tool_calls = parsed_response.get("tool_calls", []) or []
+        tool_calls = self._normalize_tool_calls_to_openai(raw_tool_calls) if raw_tool_calls else None
 
         return {
             "id": f"chatcmpl-{request_id}",
@@ -479,9 +483,7 @@ class ChatToGenerateAdapter:
                         "role": "assistant",
                         "reasoning_content": reasoning_content,
                         "content": message_content,
-                        "tool_calls": (
-                            parsed_response.get("tool_calls", []) if parsed_response.get("tool_calls") else None
-                        ),
+                        "tool_calls": tool_calls,
                     },
                     "finish_reason": finish_reason,
                 }
@@ -564,9 +566,9 @@ class ChatToGenerateAdapter:
         timeout: float = 1800.0,
         max_retries: int = 10,
     ) -> StreamingResponse:
-        print(f"[stream] opening raw provider stream: {url}")
+        logger.debug("Opening raw provider stream: %s", url)
         stream = await open_provider_stream(url, headers, body, timeout=timeout, max_retries=max_retries)
-        print(f"[stream] raw provider stream established: {url}")
+        logger.debug("Raw provider stream established: %s", url)
 
         async def iterator():
             try:
@@ -588,7 +590,7 @@ class ChatToGenerateAdapter:
         upstream_request = dict(generate_request)
         upstream_request.pop("stream", None)
 
-        print(f"[stream] mocking chat stream from non-stream generate: {self.router_url}/generate")
+        logger.debug("Mocking chat stream from non-stream generate: %s/generate", self.router_url)
         resp = await self.forward_request(upstream_request, headers)
         if resp.status_code != 200:
             raise RuntimeError(f"sglang returned status {resp.status_code}: {resp.text[:500]}")
@@ -673,9 +675,9 @@ class ChatToGenerateAdapter:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         url = f"{self.router_url}/v1/completions"
-        print(f"[stream] opening completions stream: {url}")
+        logger.debug("Opening completions stream: %s", url)
         stream = await open_provider_stream(url, headers, completions_request, timeout=1800.0, max_retries=10)
-        print(f"[stream] completions stream established: {url}")
+        logger.debug("Completions stream established: %s", url)
         request_id = str(uuid.uuid4())
         created = int(time.time())
 
@@ -784,7 +786,7 @@ class ChatToGenerateAdapter:
                     timeout=httpx.Timeout(1800),
                 )
                 if resp.status_code in retry_statuses:
-                    print(f"[DEBUG] Retry status {resp.status_code}, retrying in {retry_delay}s...")
+                    logger.debug("Retry status %s, retrying in %ss", resp.status_code, retry_delay)
                     if attempt < max_retries:
                         await asyncio.sleep(retry_delay)
                         continue
@@ -792,7 +794,7 @@ class ChatToGenerateAdapter:
                 return resp
 
             except httpx.RequestError as e:
-                print(f"[DEBUG] Request error: {e}, retrying in {retry_delay}s...")
+                logger.debug("Request error: %s, retrying in %ss", e, retry_delay)
                 if attempt < max_retries:
                     await asyncio.sleep(retry_delay)
                     continue
@@ -919,9 +921,9 @@ class ChatToGenerateAdapter:
 
         for attempt in range(1, max_retries + 1):
             # Debug log
-            print(f"[DEBUG] Attempt {attempt}/{max_retries}: Forwarding to {url}")
+            logger.debug("Attempt %d/%d forwarding to %s", attempt, max_retries, url)
             if attempt == 1:
-                print(f"[DEBUG] Headers: {headers}")
+                logger.debug("Request headers: %s", headers)
 
             try:
                 resp = await client.request(
@@ -932,14 +934,14 @@ class ChatToGenerateAdapter:
                     timeout=httpx.Timeout(1800),
                 )
 
-                print(f"[DEBUG] Response status: {resp.status_code}")
+                logger.debug("Response status: %s", resp.status_code)
 
                 if resp.status_code != 200:
-                    print(f"[DEBUG] Response headers: {dict(resp.headers)}")
-                    print(f"[DEBUG] Response body: {resp.text[:1000]}")
+                    logger.debug("Response headers: %s", dict(resp.headers))
+                    logger.debug("Response body: %s", resp.text[:1000])
 
                     if attempt < max_retries:
-                        print(f"[DEBUG] Non-200 status, retrying in {retry_delay}s...")
+                        logger.debug("Non-200 status, retrying in %ss", retry_delay)
                         await asyncio.sleep(retry_delay)
                         continue
 
@@ -949,21 +951,21 @@ class ChatToGenerateAdapter:
                 try:
                     return resp.json()
                 except Exception as e:
-                    print(f"[DEBUG] JSON parse error: {e}")
-                    print(f"[DEBUG] Response text: {resp.text[:500]}")
+                    logger.debug("JSON parse error: %s", e)
+                    logger.debug("Response text: %s", resp.text[:500])
 
                     if attempt < max_retries:
-                        print(f"[DEBUG] JSON parse failed, retrying in {retry_delay}s...")
+                        logger.debug("JSON parse failed, retrying in %ss", retry_delay)
                         await asyncio.sleep(retry_delay)
                         continue
 
                     raise RuntimeError(f"Failed to parse v1/chat/completions response: {e}")
 
             except httpx.RequestError as e:
-                print(f"[DEBUG] Request error: {e}")
+                logger.debug("Request error: %s", e)
 
                 if attempt < max_retries:
-                    print(f"[DEBUG] Request failed, retrying in {retry_delay}s...")
+                    logger.debug("Request failed, retrying in %ss", retry_delay)
                     await asyncio.sleep(retry_delay)
                     continue
 
@@ -988,7 +990,7 @@ class ChatToGenerateAdapter:
             Chat completions format response
         """
         # Step 1: Build tools system prompt if tools are present
-        messages = chat_request.get("messages", [])
+        messages = deepcopy(chat_request.get("messages", []))
         tools = chat_request.get("tools", [])
 
         # Add tools system prompt if tools are provided
@@ -1047,10 +1049,6 @@ class ChatToGenerateAdapter:
         completions_response = await self._process_completions_via_v1(completions_request, request_headers)
 
         completion_text = completions_response["choices"][0]["text"]
-        
-        print(completion_text)
-        print(repr(completion_text[-8:]))
-        print(completion_text.endswith("<|user|>"))
 
         if not completion_text or not completion_text.strip():
             raise RuntimeError("API returned an empty response")
@@ -1068,7 +1066,8 @@ class ChatToGenerateAdapter:
 
         content = parsed.get("content", "")
         reasoning_content = parsed.get("reasoning_content", "")
-        tool_calls = parsed.get("tool_calls", []) or []
+        raw_tool_calls = parsed.get("tool_calls", []) or []
+        tool_calls = self._normalize_tool_calls_to_openai(raw_tool_calls) if raw_tool_calls else []
 
         message = {
             "role": "assistant",
@@ -1077,9 +1076,6 @@ class ChatToGenerateAdapter:
 
         if reasoning_content:
             message["reasoning_content"] = reasoning_content
-            print(f"[DEBUG] Added reasoning_content field to message")
-        else:
-            print(f"[DEBUG] No reasoning_content to add")
 
         # Add tool_calls if present
         if tool_calls:
@@ -1102,8 +1098,11 @@ class ChatToGenerateAdapter:
             ),
         }
 
-        print(
-            f"[DEBUG] Parsed completions response: reasoning={len(reasoning_content)} chars, content={len(content)} chars, tool_calls={len(tool_calls)}"
+        logger.debug(
+            "Parsed completions response: reasoning=%d chars, content=%d chars, tool_calls=%d",
+            len(reasoning_content),
+            len(content),
+            len(tool_calls),
         )
 
         return chat_response
@@ -1159,7 +1158,7 @@ class ChatToGenerateAdapter:
         retry_delay = 2  # seconds
 
         for attempt in range(1, max_retries + 1):
-            print(f"[DEBUG] Attempt {attempt}/{max_retries}: Forwarding to {url}")
+            logger.debug("Attempt %d/%d forwarding to %s", attempt, max_retries, url)
             try:
                 resp = await client.request(
                     method="POST",
@@ -1169,13 +1168,13 @@ class ChatToGenerateAdapter:
                     timeout=httpx.Timeout(1800),
                 )
 
-                print(f"[DEBUG] Response status: {resp.status_code}")
+                logger.debug("Response status: %s", resp.status_code)
 
                 if resp.status_code != 200:
-                    print(f"[DEBUG] Response body: {resp.text[:1000]}")
+                    logger.debug("Response body: %s", resp.text[:1000])
 
                     if attempt < max_retries:
-                        print(f"[DEBUG] Non-200 status, retrying in {retry_delay}s...")
+                        logger.debug("Non-200 status, retrying in %ss", retry_delay)
                         await asyncio.sleep(retry_delay)
                         continue
 
@@ -1185,21 +1184,21 @@ class ChatToGenerateAdapter:
                 try:
                     return resp.json()
                 except Exception as e:
-                    print(f"[DEBUG] JSON parse error: {e}")
-                    print(f"[DEBUG] Response text: {resp.text[:500]}")
+                    logger.debug("JSON parse error: %s", e)
+                    logger.debug("Response text: %s", resp.text[:500])
 
                     if attempt < max_retries:
-                        print(f"[DEBUG] JSON parse failed, retrying in {retry_delay}s...")
+                        logger.debug("JSON parse failed, retrying in %ss", retry_delay)
                         await asyncio.sleep(retry_delay)
                         continue
 
                     raise RuntimeError(f"Failed to parse v1/completions response: {e}")
 
             except httpx.RequestError as e:
-                print(f"[DEBUG] Request error: {e}")
+                logger.debug("Request error: %s", e)
 
                 if attempt < max_retries:
-                    print(f"[DEBUG] Request failed, retrying in {retry_delay}s...")
+                    logger.debug("Request failed, retrying in %ss", retry_delay)
                     await asyncio.sleep(retry_delay)
                     continue
 
@@ -1278,12 +1277,12 @@ def _get_adapter(request: Request) -> ChatToGenerateAdapter:
 async def chat_completions(request: Request):
     """Endpoint: chat completions that internally use generate API"""
     request_id = str(uuid.uuid4())
-    print(f"[chat_completions] Request {request_id}")
+    logger.info("chat_completions request_id=%s", request_id)
 
     try:
         chat_request = await asyncio.wait_for(request.json(), timeout=1800)
-    except Exception as e:
-        traceback.print_exc()
+    except Exception:
+        logger.exception("chat_completions invalid JSON request_id=%s", request_id)
         return Response(
             content=orjson.dumps({"error": "Invalid JSON or timeout"}), status_code=400, media_type="application/json"
         )
@@ -1296,8 +1295,7 @@ async def chat_completions(request: Request):
         return Response(content=orjson.dumps(response), status_code=200, media_type="application/json")
 
     except Exception as e:
-        traceback.print_exc()
-        print(f"[chat_completions] Error: {e}")
+        logger.exception("chat_completions failed request_id=%s", request_id)
         return Response(content=orjson.dumps({"error": str(e)}), status_code=502, media_type="application/json")
 
 
@@ -1305,12 +1303,12 @@ async def chat_completions(request: Request):
 async def completions(request: Request):
     """Endpoint: text completions (raw prompt completion)"""
     request_id = str(uuid.uuid4())
-    print(f"[completions] Request {request_id}")
+    logger.info("completions request_id=%s", request_id)
 
     try:
         completions_request = await asyncio.wait_for(request.json(), timeout=1800)
-    except Exception as e:
-        traceback.print_exc()
+    except Exception:
+        logger.exception("completions invalid JSON request_id=%s", request_id)
         return Response(
             content=orjson.dumps({"error": "Invalid JSON or timeout"}), status_code=400, media_type="application/json"
         )
@@ -1325,8 +1323,7 @@ async def completions(request: Request):
         return Response(content=orjson.dumps(response), status_code=200, media_type="application/json")
 
     except Exception as e:
-        traceback.print_exc()
-        print(f"[completions] Error: {e}")
+        logger.exception("completions failed request_id=%s", request_id)
         return Response(content=orjson.dumps({"error": str(e)}), status_code=502, media_type="application/json")
 
 
@@ -1354,7 +1351,7 @@ async def tokens_clear(request: Request):
         )
         return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
     except Exception as e:
-        traceback.print_exc()
+        logger.exception("tokens_clear failed")
         return Response(content=orjson.dumps({"error": str(e)}), status_code=502, media_type="application/json")
 
 

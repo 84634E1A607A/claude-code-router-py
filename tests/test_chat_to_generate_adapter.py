@@ -61,6 +61,72 @@ class TestMainKeyResolution(unittest.TestCase):
 
         self.assertEqual(request["main_key"], "claude-session-456")
 
+    def test_normalize_messages_for_chat_template_does_not_mutate_input(self):
+        messages = [{
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "function": {
+                    "name": "Read",
+                    "arguments": "{\"path\":\"/tmp/file.txt\"}",
+                }
+            }],
+        }]
+        original_messages = json.loads(json.dumps(messages))
+
+        normalized = self.adapter._normalize_messages_for_chat_template(messages)
+
+        self.assertEqual(messages, original_messages)
+        self.assertEqual(
+            normalized[0]["tool_calls"],
+            [{"name": "Read", "arguments": {"path": "/tmp/file.txt"}}],
+        )
+
+    def test_build_generate_request_does_not_mutate_messages(self):
+        self.adapter.tokenizer = Mock()
+        self.adapter.tokenizer.apply_chat_template.return_value = "prompt"
+        request = {
+            "messages": [
+                {"role": "system", "content": "existing system"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "function": {
+                            "name": "Read",
+                            "arguments": "{\"path\":\"/tmp/file.txt\"}",
+                        }
+                    }],
+                },
+            ],
+            "tools": [{"type": "function", "function": {"name": "Read", "parameters": {"type": "object"}}}],
+        }
+        original_request = json.loads(json.dumps(request))
+
+        self.adapter._build_generate_request(request)
+
+        self.assertEqual(request, original_request)
+
+    def test_build_chat_completion_response_normalizes_tool_calls(self):
+        response = self.adapter._build_chat_completion_response(
+            "req-1",
+            {
+                "content": "",
+                "reasoning_content": "",
+                "tool_calls": [{
+                    "tool_call_id": "tool-call-1",
+                    "name": "Read",
+                    "arguments": "{\"path\":\"/tmp/file.txt\"}",
+                }],
+            },
+        )
+
+        tool_call = response["choices"][0]["message"]["tool_calls"][0]
+        self.assertEqual(tool_call["id"], "tool-call-1")
+        self.assertEqual(tool_call["type"], "function")
+        self.assertEqual(tool_call["function"]["name"], "Read")
+        self.assertEqual(tool_call["function"]["arguments"], "{\"path\":\"/tmp/file.txt\"}")
+
 class TestStreamingPaths(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.adapter = chat_to_generate_adapter.ChatToGenerateAdapter(
@@ -95,6 +161,80 @@ class TestStreamingPaths(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out, "stream-response")
         streamed_request = self.adapter._stream_completions_to_chat.await_args.args[0]
         self.assertTrue(streamed_request["stream"])
+
+    async def test_process_chat_via_completions_does_not_mutate_messages(self):
+        self.adapter.tokenizer = Mock()
+        self.adapter.tokenizer.apply_chat_template.return_value = "prompt"
+        self.adapter._process_completions_via_v1 = AsyncMock(
+            return_value={
+                "id": "cmpl-1",
+                "created": 1,
+                "model": "m",
+                "choices": [{"text": "plain answer", "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            }
+        )
+        request = {
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "existing system"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "function": {
+                            "name": "Read",
+                            "arguments": "{\"path\":\"/tmp/file.txt\"}",
+                        }
+                    }],
+                },
+            ],
+            "tools": [{"type": "function", "function": {"name": "Read", "parameters": {"type": "object"}}}],
+        }
+        original_request = json.loads(json.dumps(request))
+
+        await self.adapter._process_chat_via_completions(request, {})
+
+        self.assertEqual(request, original_request)
+
+    async def test_process_chat_via_completions_normalizes_tool_calls(self):
+        self.adapter.tokenizer = Mock()
+        self.adapter.tokenizer.apply_chat_template.return_value = "prompt"
+        self.adapter._process_completions_via_v1 = AsyncMock(
+            return_value={
+                "id": "cmpl-1",
+                "created": 1,
+                "model": "m",
+                "choices": [{
+                    "text": "<tool_call>Read<arg_key>path</arg_key><arg_value>/tmp/file.txt</arg_value></tool_call>",
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            }
+        )
+
+        out = await self.adapter._process_chat_via_completions(
+            {
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "Read",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                        },
+                    },
+                }],
+            },
+            {},
+        )
+
+        tool_call = out["choices"][0]["message"]["tool_calls"][0]
+        self.assertEqual(tool_call["type"], "function")
+        self.assertEqual(tool_call["function"]["name"], "Read")
+        self.assertEqual(tool_call["function"]["arguments"], "{\"path\": \"/tmp/file.txt\"}")
 
     async def test_process_completions_via_v1_preserves_stream(self):
         self.adapter._stream_raw_provider_response = AsyncMock(return_value="stream-response")

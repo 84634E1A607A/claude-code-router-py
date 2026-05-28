@@ -62,6 +62,7 @@ _DP_OVERRIDE_HEADER = "X-Routed-DP-Rank"
 _REQUEST_PRIORITY_HEADER = "X-Request-Priority"
 _DP_SERVER_INFO_TTL_SEC = 30
 _SGLANG_HEALTH_REFRESH_INTERVAL_SEC = 60.0
+_SGLANG_TOKENIZE_TIMEOUT_SEC = 5.0
 _INVALID_DP_RANK_RE = re.compile(r"routed_dp_rank.*out of range", re.IGNORECASE | re.DOTALL)
 _WHITESPACE_RE = re.compile(r"\s+")
 _CONFIG_RELOAD_INTERVAL_SEC = 1.0
@@ -1719,7 +1720,7 @@ def _sglang_tokenize_url(provider: dict) -> str:
 
 async def _count_tokens_via_sglang(provider: dict, model: str, prompt: str) -> int | None:
     client = get_shared_client()
-    timeout = _timeout()
+    timeout = min(_timeout(), _SGLANG_TOKENIZE_TIMEOUT_SEC)
     payload = {
         "model": model,
         "prompt": prompt,
@@ -1730,7 +1731,7 @@ async def _count_tokens_via_sglang(provider: dict, model: str, prompt: str) -> i
             _sglang_tokenize_url(provider),
             headers=_provider_headers(provider),
             json=payload,
-            timeout=timeout,
+            timeout=upstream_timeout(timeout),
         )
     except Exception:
         logger.debug("SGLang /tokenize request failed", exc_info=True)

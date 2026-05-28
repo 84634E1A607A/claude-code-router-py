@@ -990,6 +990,35 @@ class TestTokenCounting(unittest.TestCase):
         self.assertEqual(srv_mod._sglang_tokenize_url(provider), "http://host:30000/tokenize")
 
 
+class TestSGLangTokenCounting(unittest.IsolatedAsyncioTestCase):
+
+    async def test_count_tokens_via_sglang_uses_fail_fast_timeout(self):
+        import server as srv_mod
+
+        class FakeClient:
+            def __init__(self):
+                self.timeout = None
+
+            async def post(self, *args, **kwargs):
+                self.timeout = kwargs["timeout"]
+                return httpx.Response(200, json={"count": 11})
+
+        fake_client = FakeClient()
+        provider = {
+            "api_base_url": "http://host:30000/v1/chat/completions",
+            "api_key": "k",
+        }
+
+        with patch.object(srv_mod, "_config", {"API_TIMEOUT_MS": 600_000}), \
+             patch.object(srv_mod, "get_shared_client", return_value=fake_client):
+            count = await srv_mod._count_tokens_via_sglang(provider, "/model", "prompt")
+
+        self.assertEqual(count, 11)
+        self.assertIsInstance(fake_client.timeout, httpx.Timeout)
+        self.assertEqual(fake_client.timeout.read, srv_mod._SGLANG_TOKENIZE_TIMEOUT_SEC)
+        self.assertEqual(fake_client.timeout.connect, 1.0)
+
+
 class TestSGLangHealthChecks(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
