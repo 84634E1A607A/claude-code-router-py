@@ -45,7 +45,31 @@ def _dump_dir() -> str:
     return d
 
 
-def save_dump(openai_req: dict, response_obj: object, label: str = "") -> None:
+def _error_dump_dir() -> str:
+    d = os.environ.get("CCR_ERROR_DUMP_DIR", "error_dumps")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _write_dump(payload: dict, dump_dir: str, label: str, log_prefix: str) -> str | None:
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    uid = uuid.uuid4().hex[:8]
+    name = f"{ts}_{uid}"
+    if label:
+        name = f"{name}_{label}"
+    path = os.path.join(dump_dir, f"{name}.json")
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        logger.warning("%s dump saved to %s", log_prefix, path)
+        return path
+    except Exception as exc:
+        logger.error("%s failed to write dump %s: %s", log_prefix, path, exc)
+        return None
+
+
+def save_dump(openai_req: dict, response_obj: object, label: str = "") -> str | None:
     """
     Write a JSON dump of the request + response to disk.
 
@@ -53,23 +77,20 @@ def save_dump(openai_req: dict, response_obj: object, label: str = "") -> None:
       - a dict  (non-streaming OpenAI response)
       - a str   (assembled streaming text)
     """
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    uid = uuid.uuid4().hex[:8]
-    name = f"{ts}_{uid}"
-    if label:
-        name = f"{name}_{label}"
-    path = os.path.join(_dump_dir(), f"{name}.json")
-
     payload = {
         "request": openai_req,
         "response": response_obj,
     }
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        logger.warning("CCR_DEBUG: sensitive token found — dump saved to %s", path)
-    except Exception as exc:
-        logger.error("CCR_DEBUG: failed to write dump %s: %s", path, exc)
+    return _write_dump(payload, _dump_dir(), label, "CCR_DEBUG: sensitive token found")
+
+
+def save_http_error_dump(request_obj: dict, response_obj: dict, label: str = "http_error") -> str | None:
+    """Write a JSON dump of the inbound request and error response to disk."""
+    payload = {
+        "request": request_obj,
+        "response": response_obj,
+    }
+    return _write_dump(payload, _error_dump_dir(), label, "CCR_ERROR")
 
 
 def log_openai_request(openai_req: dict) -> None:

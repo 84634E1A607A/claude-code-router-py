@@ -9,6 +9,26 @@ from typing import Any, AsyncIterator
 # Anthropic → OpenAI  (request)
 # ---------------------------------------------------------------------------
 
+def _normalize_tool_use_input(input_value: Any) -> dict[str, Any]:
+    """Normalize Anthropic tool_use.input into an object-shaped payload."""
+    if input_value is None:
+        return {}
+    if isinstance(input_value, dict):
+        return input_value
+    if isinstance(input_value, str):
+        raw = input_value.strip()
+        if not raw:
+            return {}
+        try:
+            loaded = json.loads(raw)
+        except json.JSONDecodeError:
+            return {"_raw": input_value}
+        if isinstance(loaded, dict):
+            return loaded
+        return {"_": loaded}
+    return {"_": input_value}
+
+
 def anthropic_to_openai(req: dict) -> dict:
     """Convert an Anthropic /v1/messages request body to OpenAI chat format."""
     messages: list[dict] = []
@@ -88,7 +108,7 @@ def anthropic_to_openai(req: dict) -> dict:
                         "type": "function",
                         "function": {
                             "name": block["name"],
-                            "arguments": json.dumps(block.get("input", {})),
+                            "arguments": json.dumps(_normalize_tool_use_input(block.get("input"))),
                         },
                     })
                 # thinking blocks are internal — skip them

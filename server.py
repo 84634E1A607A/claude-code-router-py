@@ -44,6 +44,7 @@ from config import (
 )
 from converter import anthropic_to_openai, openai_to_anthropic, stream_openai_to_anthropic
 from debug import check_and_save_nonstreaming, check_and_save_streaming, log_openai_request
+from debug import save_http_error_dump
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,7 @@ _WHITESPACE_RE = re.compile(r"\s+")
 _CONFIG_RELOAD_INTERVAL_SEC = 1.0
 _MAIN_REQUEST_PRIORITY = 0
 _PROVIDER_RETRY_STATUSES = {429, 500, 502, 503, 504}
+_LOG_REDACTED_HEADERS = {"authorization", "proxy-authorization", "x-api-key", "cookie"}
 
 
 @dataclass
@@ -873,6 +875,205 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Claude Code Router (Python)", lifespan=lifespan)
 
 
+def _serialize_raw_headers(raw_headers: list[tuple[bytes, bytes]]) -> list[list[str]]:
+    return [[k.decode("latin-1"), v.decode("latin-1")] for k, v in raw_headers]
+
+
+def _serialize_http_body(body: bytes | str | bytearray | memoryview | None) -> dict[str, Any]:
+    if body is None:
+        return {"body_size": 0, "body_text": ""}
+
+    if isinstance(body, str):
+        raw = body.encode("utf-8")
+        text = body
+    else:
+        raw = bytes(body)
+        text = raw.decode("utf-8", errors="replace")
+
+    payload: dict[str, Any] = {
+        "body_size": len(raw),
+        "body_text": text,
+    }
+    if text:
+        try:
+            payload["body_json"] = json.loads(text)
+        except Exception:
+            pass
+    return payload
+
+
+def _build_error_request_dump(request: Request, body: bytes | None = None) -> dict[str, Any]:
+    return {
+        "method": request.method,
+        "url": str(request.url),
+        "path": request.url.path,
+        "query": request.url.query,
+        "headers": _serialize_raw_headers(request.headers.raw),
+        **_serialize_http_body(body if body is not None else b""),
+    }
+
+
+def _build_error_response_dump(response: Response | None, *, exc: Exception | None = None) -> dict[str, Any]:
+    return _build_error_response_dump_with_body(response, None, exc=exc)
+
+
+def _build_error_response_dump_with_body(
+    response: Response | None,
+    body: bytes | None,
+    *,
+    exc: Exception | None = None,
+) -> dict[str, Any]:
+    if response is None:
+        payload: dict[str, Any] = {
+            "status_code": 500,
+            "headers": [],
+            "body_size": 0,
+            "body_text": "",
+        }
+    else:
+        payload = {
+            "status_code": response.status_code,
+            "headers": _serialize_raw_headers(response.raw_headers),
+            **_serialize_http_body(body if body is not None else getattr(response, "body", b"")),
+        }
+        media_type = getattr(response, "media_type", None)
+        if media_type:
+            payload["media_type"] = media_type
+
+    if exc is not None:
+        payload["exception"] = repr(exc)
+    return payload
+
+
+def _sanitize_headers_for_log(headers: Any) -> Any:
+    if isinstance(headers, dict):
+        sanitized_dict: dict[Any, Any] = {}
+        for name, value in headers.items():
+            if isinstance(name, str) and name.lower() in _LOG_REDACTED_HEADERS:
+                sanitized_dict[name] = "<redacted>"
+            else:
+                sanitized_dict[name] = value
+        return sanitized_dict
+    if not isinstance(headers, list):
+        return headers
+
+    sanitized: list[Any] = []
+    for entry in headers:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            sanitized.append(entry)
+            continue
+        name, value = entry
+        if isinstance(name, str) and name.lower() in _LOG_REDACTED_HEADERS:
+            sanitized.append([name, "<redacted>"])
+        else:
+            sanitized.append([name, value])
+    return sanitized
+
+
+def _sanitize_error_dump_for_log(payload: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(payload)
+    if "headers" in sanitized:
+        sanitized["headers"] = _sanitize_headers_for_log(sanitized["headers"])
+    return sanitized
+
+
+def _log_http_error_capture(
+    request_dump: dict[str, Any],
+    response_dump: dict[str, Any],
+    *,
+    dump_path: str | None = None,
+) -> None:
+    status_code = int(response_dump.get("status_code") or 500)
+    log_fn = logger.error if status_code >= 500 else logger.warning
+    request_payload = json.dumps(_sanitize_error_dump_for_log(request_dump), ensure_ascii=False)
+    response_payload = json.dumps(_sanitize_error_dump_for_log(response_dump), ensure_ascii=False)
+    if dump_path:
+        log_fn(
+            "HTTP error captured request=%s response=%s dump_path=%s",
+            request_payload,
+            response_payload,
+            dump_path,
+        )
+        return
+    log_fn("HTTP error captured request=%s response=%s", request_payload, response_payload)
+
+
+async def _capture_http_error_for_response(
+    request: Request,
+    response: Response | None,
+    *,
+    request_body: bytes | None = None,
+    response_body: bytes | None = None,
+    exc: Exception | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], str | None]:
+    request_dump = _build_error_request_dump(request, request_body)
+    response_dump = _build_error_response_dump_with_body(response, response_body, exc=exc)
+    dump_path: str | None = None
+    try:
+        dump_path = save_http_error_dump(request_dump, response_dump)
+    except Exception:
+        logger.exception("Failed to save HTTP error dump")
+    return request_dump, response_dump, dump_path
+
+
+async def _read_response_body(response: Response) -> bytes:
+    body = getattr(response, "body", None)
+    if body not in (None, b""):
+        return bytes(body)
+
+    if not hasattr(response, "body_iterator") or response.body_iterator is None:
+        return b""
+
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.encode("utf-8") if isinstance(chunk, str) else bytes(chunk))
+    return b"".join(chunks)
+
+
+def _rebuild_response(response: Response, body: bytes) -> Response:
+    rebuilt = Response(
+        content=body,
+        status_code=response.status_code,
+        headers=dict(response.headers),
+        media_type=getattr(response, "media_type", None),
+        background=response.background,
+    )
+    return rebuilt
+
+
+@app.middleware("http")
+async def _dump_http_errors(request: Request, call_next):
+    raw_body = await request.body()
+
+    async def receive():
+        return {"type": "http.request", "body": raw_body, "more_body": False}
+
+    request = Request(request.scope, receive)
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        request_dump, response_dump, dump_path = await _capture_http_error_for_response(
+            request,
+            None,
+            request_body=raw_body,
+            exc=exc,
+        )
+        _log_http_error_capture(request_dump, response_dump, dump_path=dump_path)
+        raise
+
+    if response.status_code >= 400:
+        response_body = await _read_response_body(response)
+        request_dump, response_dump, dump_path = await _capture_http_error_for_response(
+            request,
+            response,
+            request_body=raw_body,
+            response_body=response_body,
+        )
+        _log_http_error_capture(request_dump, response_dump, dump_path=dump_path)
+        return _rebuild_response(response, response_body)
+    return response
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1355,6 +1556,36 @@ def _is_retryable_provider_failure(exc: Exception) -> bool:
     if isinstance(exc, ProviderError):
         return exc.status in _PROVIDER_RETRY_STATUSES or exc.status == 0
     return isinstance(exc, (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError))
+
+
+def _log_provider_error(
+    provider: dict,
+    url: str,
+    model: str,
+    headers: dict[str, Any],
+    provider_request: dict[str, Any],
+    exc: ProviderError,
+    *,
+    retrying: bool,
+    dp_decision: DPRoutingDecision | None = None,
+) -> None:
+    log_fn = logger.warning if retrying else logger.error
+    headers_payload = json.dumps(_sanitize_headers_for_log(headers), ensure_ascii=False)
+    request_payload = json.dumps(provider_request, ensure_ascii=False)
+    log_fn(
+        "Upstream provider error retrying=%s provider=%s model=%s url=%s slot=%s provider_dp_rank=%s "
+        "headers=%s provider_request=%s status=%s body=%s",
+        retrying,
+        provider.get("name", ""),
+        model,
+        url,
+        dp_decision.rank if dp_decision is not None else None,
+        dp_decision.provider_dp_rank if dp_decision is not None else None,
+        headers_payload,
+        request_payload,
+        exc.status,
+        exc.body,
+    )
 
 
 def _log_dp_routing(provider: dict, decision: DPRoutingDecision, remapped: bool = False) -> None:
@@ -1851,11 +2082,13 @@ async def messages(request: Request):
     if is_stream:
         # Eagerly connect to check provider status before committing to HTTP 200
         attempted_provider_keys: set[str] = set()
+        last_provider_error: ProviderError | None = None
         while True:
             try:
                 stream = await open_provider_stream(url, headers, openai_req, timeout, max_retries)
                 break
             except ProviderError as exc:
+                last_provider_error = exc
                 if _is_invalid_dp_rank_error(exc) and dp_decision.rank is not None:
                     selected_slot, openai_req, dp_decision = await _retry_message_request_for_invalid_rank(
                         request,
@@ -1877,9 +2110,28 @@ async def messages(request: Request):
                     )
                     continue
                 if not _is_retryable_provider_failure(exc):
+                    _log_provider_error(
+                        provider,
+                        url,
+                        model,
+                        headers,
+                        openai_req,
+                        exc,
+                        retrying=False,
+                        dp_decision=dp_decision,
+                    )
                     _runtime_metrics.finish_request(metrics_ctx, success=False)
                     raise HTTPException(exc.status or 502, exc.body or str(exc))
-                logger.warning("Provider stream failed, trying another provider if available: %s", exc)
+                _log_provider_error(
+                    provider,
+                    url,
+                    model,
+                    headers,
+                    openai_req,
+                    exc,
+                    retrying=True,
+                    dp_decision=dp_decision,
+                )
                 attempted_provider_keys.add(_dp_cache_key(provider))
             except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
                 logger.warning("Provider stream connection failed, trying another provider if available: %s", exc)
@@ -1913,6 +2165,17 @@ async def messages(request: Request):
                 _runtime_metrics.finish_request(metrics_ctx, success=False)
                 raise
             except NoProviderRetryLeft:
+                if last_provider_error is not None:
+                    _log_provider_error(
+                        provider,
+                        url,
+                        model,
+                        headers,
+                        openai_req,
+                        last_provider_error,
+                        retrying=False,
+                        dp_decision=dp_decision,
+                    )
                 _runtime_metrics.finish_request(metrics_ctx, success=False)
                 raise HTTPException(502, "All configured providers are unavailable")
 
@@ -1928,11 +2191,13 @@ async def messages(request: Request):
 
     # Non-streaming
     attempted_provider_keys: set[str] = set()
+    last_provider_error: ProviderError | None = None
     while True:
         try:
             openai_resp = await post_json(url, headers, openai_req, timeout=timeout, max_retries=max_retries)
             break
         except ProviderError as exc:
+            last_provider_error = exc
             if _is_invalid_dp_rank_error(exc) and dp_decision.rank is not None:
                 selected_slot, openai_req, dp_decision = await _retry_message_request_for_invalid_rank(
                     request,
@@ -1954,10 +2219,28 @@ async def messages(request: Request):
                 )
                 continue
             if not _is_retryable_provider_failure(exc):
-                logger.error("Provider error: %s", exc)
+                _log_provider_error(
+                    provider,
+                    url,
+                    model,
+                    headers,
+                    openai_req,
+                    exc,
+                    retrying=False,
+                    dp_decision=dp_decision,
+                )
                 _runtime_metrics.finish_request(metrics_ctx, success=False)
                 raise HTTPException(exc.status or 502, exc.body or str(exc))
-            logger.warning("Provider error, trying another provider if available: %s", exc)
+            _log_provider_error(
+                provider,
+                url,
+                model,
+                headers,
+                openai_req,
+                exc,
+                retrying=True,
+                dp_decision=dp_decision,
+            )
             attempted_provider_keys.add(_dp_cache_key(provider))
         except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
             logger.warning("Provider connection failed, trying another provider if available: %s", exc)
@@ -1977,6 +2260,17 @@ async def messages(request: Request):
                 force_refresh=True,
             )
         except NoProviderRetryLeft:
+            if last_provider_error is not None:
+                _log_provider_error(
+                    provider,
+                    url,
+                    model,
+                    headers,
+                    openai_req,
+                    last_provider_error,
+                    retrying=False,
+                    dp_decision=dp_decision,
+                )
             _runtime_metrics.finish_request(metrics_ctx, success=False)
             raise HTTPException(502, "All configured providers are unavailable")
         provider = selected_slot.provider
@@ -2274,6 +2568,7 @@ async def legacy_complete(request: Request):
     try:
         openai_resp = await post_json(url, headers, openai_req, timeout=timeout)
     except ProviderError as exc:
+        _log_provider_error(provider, url, model, headers, openai_req, exc, retrying=False)
         raise HTTPException(exc.status or 502, exc.body or str(exc))
     except Exception as exc:
         logger.exception("Legacy completion error")

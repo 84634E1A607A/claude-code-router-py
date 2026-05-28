@@ -124,6 +124,16 @@ class TestAnthropicToOpenAI(unittest.TestCase):
         self.assertEqual(tc["id"], "tu_1")
         self.assertEqual(json.loads(tc["function"]["arguments"]), {"x": 1})
 
+    def test_tool_use_in_assistant_normalizes_stringified_object_input(self):
+        out = anthropic_to_openai({"model": "m", "messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tu_1", "name": "fn", "input": "{\"x\": 1}"},
+            ]}
+        ]})
+
+        tc = out["messages"][0]["tool_calls"][0]
+        self.assertEqual(json.loads(tc["function"]["arguments"]), {"x": 1})
+
     def test_tool_result_in_user(self):
         out = anthropic_to_openai({"model": "m", "messages": [
             {"role": "user", "content": [
@@ -1918,6 +1928,12 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
             "usage": {"prompt_tokens": 10, "completion_tokens": 1},
         }
 
+    def _load_single_error_dump(self, dump_dir):
+        files = os.listdir(dump_dir)
+        self.assertEqual(len(files), 1, files)
+        with open(os.path.join(dump_dir, files[0]), "r", encoding="utf-8") as handle:
+            return json.load(handle)
+
     async def test_messages_injects_session_rank_and_response_headers(self):
         sent_bodies = []
 
@@ -2135,6 +2151,60 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status_code, 400, resp.text)
         self.assertIn("missing-model", resp.text)
         self.assertIn("/model", resp.text)
+
+    async def test_400_response_writes_error_dump(self):
+        with tempfile.TemporaryDirectory() as dump_dir, \
+             patch.dict(os.environ, {"CCR_ERROR_DUMP_DIR": dump_dir}, clear=False):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req({"model": "missing-model"}),
+            )
+            dump = self._load_single_error_dump(dump_dir)
+
+        self.assertEqual(resp.status_code, 400, resp.text)
+        self.assertEqual(dump["request"]["method"], "POST")
+        self.assertEqual(dump["request"]["path"], "/v1/messages")
+        self.assertEqual(dump["request"]["body_json"]["model"], "missing-model")
+        self.assertEqual(dump["response"]["status_code"], 400)
+        self.assertEqual(dump["response"]["body_json"]["detail"], resp.json()["detail"])
+
+    async def test_502_response_writes_error_dump(self):
+        with tempfile.TemporaryDirectory() as dump_dir, \
+             patch.dict(os.environ, {"CCR_ERROR_DUMP_DIR": dump_dir}, clear=False), \
+             patch.object(self.srv, "_count_request_input_tokens", new=AsyncMock(return_value=(0, None))), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=RuntimeError("kaboom"))):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+            )
+            dump = self._load_single_error_dump(dump_dir)
+
+        self.assertEqual(resp.status_code, 502, resp.text)
+        self.assertEqual(dump["request"]["method"], "POST")
+        self.assertEqual(dump["request"]["path"], "/v1/messages")
+        self.assertEqual(
+            dump["request"]["body_json"]["messages"][0]["content"],
+            "Reply with exactly: PONG",
+        )
+        self.assertEqual(dump["response"]["status_code"], 502)
+        self.assertEqual(dump["response"]["body_json"]["detail"], "kaboom")
+
+    async def test_502_response_logs_http_error_capture(self):
+        with tempfile.TemporaryDirectory() as dump_dir, \
+             patch.dict(os.environ, {"CCR_ERROR_DUMP_DIR": dump_dir}, clear=False), \
+             patch.object(self.srv, "_count_request_input_tokens", new=AsyncMock(return_value=(0, None))), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=RuntimeError("kaboom"))), \
+             self.assertLogs(self.srv.logger, level="ERROR") as captured:
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+            )
+
+        self.assertEqual(resp.status_code, 502, resp.text)
+        joined = "\n".join(captured.output)
+        self.assertIn("HTTP error captured", joined)
+        self.assertIn('"path": "/v1/messages"', joined)
+        self.assertIn('"detail": "kaboom"', joined)
 
     async def test_messages_without_sticky_headers_gets_generated_session(self):
         """When no session header is provided, a UUID is generated and DP routing still happens."""
@@ -2741,6 +2811,36 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(resp.headers["X-Router-Provider"], "second")
 
+    async def test_retryable_provider_failure_logs_full_upstream_body_before_502(self):
+        upstream_body = ("provider overload " * 20) + "TAIL"
+
+        with tempfile.TemporaryDirectory() as dump_dir, \
+             patch.dict(os.environ, {"CCR_ERROR_DUMP_DIR": dump_dir}, clear=False), \
+             patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=4)), \
+             patch.object(self.srv, "_count_request_input_tokens", new=AsyncMock(return_value=(0, None))), \
+             patch.object(
+                 self.srv,
+                 "post_json",
+                 new=AsyncMock(side_effect=self.srv.ProviderError(503, upstream_body)),
+             ), \
+             self.assertLogs(self.srv.logger, level="WARNING") as captured:
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._CLAUDE_SESSION_HEADER: "session-sticky"},
+            )
+
+        self.assertEqual(resp.status_code, 502, resp.text)
+        joined = "\n".join(captured.output)
+        self.assertIn("Upstream provider error", joined)
+        self.assertIn("status=503", joined)
+        self.assertIn(upstream_body, joined)
+        self.assertIn("TAIL", joined)
+        self.assertIn("provider_request={", joined)
+        self.assertIn('"messages": [{"role": "user", "content": "Reply with exactly: PONG"}]', joined)
+        self.assertIn('"model": "/model"', joined)
+        self.assertIn('"Authorization": "<redacted>"', joined)
+
     async def test_multi_upstream_dp_pinning_prefers_upstreams_before_second_dp_rank(self):
         sent_requests = []
         self.srv.set_config({
@@ -2813,7 +2913,9 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
                 )
             raise self.srv.ProviderError(503, "offline")
 
-        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(side_effect=[2, None])), \
+        with tempfile.TemporaryDirectory() as dump_dir, \
+             patch.dict(os.environ, {"CCR_ERROR_DUMP_DIR": dump_dir}, clear=False), \
+             patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(side_effect=[2, None])), \
              patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
             resp = await self.client.post(
                 "/v1/messages",
