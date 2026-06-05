@@ -70,6 +70,7 @@ _CONFIG_RELOAD_INTERVAL_SEC = 1.0
 _MAIN_REQUEST_PRIORITY = 0
 _PROVIDER_RETRY_STATUSES = {429, 500, 502, 503, 504}
 _LOG_REDACTED_HEADERS = {"authorization", "proxy-authorization", "x-api-key", "cookie"}
+_STREAM_AFTER_FIRST_TOKEN_TIMEOUT_SEC = 90.0
 
 
 @dataclass
@@ -2308,9 +2309,41 @@ async def _stream_response(
     _text_buf: list[str] | None = [] if _debug_enabled() else None
     usage: dict | None = None
     completed = False
+    first_content_seen = False
+    stream_deadline: float | None = None
+    content_delta_types = {"text_delta", "thinking_delta", "input_json_delta"}
+    event_stream = stream_openai_to_anthropic(stream, message_id, model)
+    event_iter = event_stream.__aiter__()
 
     try:
-        async for event in stream_openai_to_anthropic(stream, message_id, model):
+        while True:
+            try:
+                if stream_deadline is None:
+                    event = await anext(event_iter)
+                else:
+                    async with asyncio.timeout_at(stream_deadline):
+                        event = await anext(event_iter)
+            except StopAsyncIteration:
+                break
+            except TimeoutError:
+                logger.warning(
+                    "Streaming timeout after first content model=%s message_id=%s timeout_sec=%.1f",
+                    model,
+                    message_id,
+                    _STREAM_AFTER_FIRST_TOKEN_TIMEOUT_SEC,
+                )
+                error_event = {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": (
+                            f"Stream exceeded {_STREAM_AFTER_FIRST_TOKEN_TIMEOUT_SEC:.0f}s "
+                            "after first content event"
+                        ),
+                    },
+                }
+                yield f"event: error\ndata: {_json.dumps(error_event)}\n\n"
+                return
             for line in event.split("\n"):
                 if not line.startswith("data: "):
                     continue
@@ -2320,6 +2353,15 @@ async def _stream_response(
                     continue
                 if parsed.get("type") == "message_delta" and isinstance(parsed.get("usage"), dict):
                     usage = _usage_from_anthropic_message(parsed)
+                if (
+                    not first_content_seen
+                    and parsed.get("type") == "content_block_delta"
+                    and (parsed.get("delta") or {}).get("type") in content_delta_types
+                ):
+                    first_content_seen = True
+                    stream_deadline = (
+                        asyncio.get_running_loop().time() + _STREAM_AFTER_FIRST_TOKEN_TIMEOUT_SEC
+                    )
             # Accumulate text for debug check (zero cost when CCR_DEBUG is off)
             if _text_buf is not None:
                 for line in event.split("\n"):

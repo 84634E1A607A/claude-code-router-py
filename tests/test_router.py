@@ -707,6 +707,180 @@ class TestConnectFailureHold(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sleep_delays, [1.0])
 
 
+class TestStreamResponseTimeout(unittest.IsolatedAsyncioTestCase):
+
+    async def asyncSetUp(self):
+        import server as srv_mod
+
+        self.srv = srv_mod
+
+    async def _collect_stream_events(self, stream, model="m", metrics_ctx=None):
+        return [event async for event in self.srv._stream_response({}, stream, model, metrics_ctx=metrics_ctx)]
+
+    def _content_delta_types(self, events):
+        parsed = []
+        for event in events:
+            for line in event.split("\n"):
+                if not line.startswith("data: "):
+                    continue
+                parsed.append(json.loads(line[6:]))
+        return [
+            item["delta"]["type"]
+            for item in parsed
+            if item.get("type") == "content_block_delta" and isinstance(item.get("delta"), dict)
+        ]
+
+    async def test_timeout_starts_after_first_text_delta(self):
+        class FakeProviderStream:
+            def __init__(self):
+                self.closed = False
+                self.first_yielded = False
+
+            async def __aiter__(self):
+                if not self.first_yielded:
+                    self.first_yielded = True
+                    yield (
+                        "data: "
+                        + json.dumps({
+                            "id": "x",
+                            "choices": [{"index": 0, "delta": {"content": "PONG"}, "finish_reason": None}],
+                        })
+                    ).encode()
+                await asyncio.sleep(0.02)
+                yield (
+                    "data: "
+                    + json.dumps({
+                        "id": "x",
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 1},
+                    })
+                ).encode()
+                yield b"data: [DONE]"
+
+            async def aclose(self):
+                self.closed = True
+
+        fake_stream = FakeProviderStream()
+
+        with patch.object(self.srv, "_STREAM_AFTER_FIRST_TOKEN_TIMEOUT_SEC", 0.01):
+            events = await self._collect_stream_events(fake_stream)
+
+        self.assertTrue(fake_stream.closed)
+        self.assertIn('"type": "text_delta"', "".join(events))
+        self.assertIn('event: error', events[-1])
+        self.assertNotIn("message_stop", "".join(events))
+
+    async def test_timeout_starts_after_first_tool_json_delta(self):
+        class FakeProviderStream:
+            def __init__(self):
+                self.closed = False
+                self.first_yielded = False
+
+            async def __aiter__(self):
+                if not self.first_yielded:
+                    self.first_yielded = True
+                    yield (
+                        "data: "
+                        + json.dumps({
+                            "id": "x",
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [{
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "function": {"name": "lookup", "arguments": "{\"q\":\"hi\"}"},
+                                    }],
+                                },
+                                "finish_reason": None,
+                            }],
+                        })
+                    ).encode()
+                await asyncio.sleep(0.02)
+                yield b"data: [DONE]"
+
+            async def aclose(self):
+                self.closed = True
+
+        fake_stream = FakeProviderStream()
+
+        with patch.object(self.srv, "_STREAM_AFTER_FIRST_TOKEN_TIMEOUT_SEC", 0.01):
+            events = await self._collect_stream_events(fake_stream)
+
+        self.assertTrue(fake_stream.closed)
+        self.assertIn("input_json_delta", self._content_delta_types(events))
+        self.assertIn('event: error', events[-1])
+        self.assertNotIn("message_stop", "".join(events))
+
+    async def test_pre_content_wait_does_not_start_timeout(self):
+        class FakeProviderStream:
+            def __init__(self):
+                self.closed = False
+
+            async def __aiter__(self):
+                await asyncio.sleep(0.02)
+                yield (
+                    "data: "
+                    + json.dumps({
+                        "id": "x",
+                        "choices": [{"index": 0, "delta": {"content": "PONG"}, "finish_reason": None}],
+                    })
+                ).encode()
+                yield (
+                    "data: "
+                    + json.dumps({
+                        "id": "x",
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 1},
+                    })
+                ).encode()
+                yield b"data: [DONE]"
+
+            async def aclose(self):
+                self.closed = True
+
+        fake_stream = FakeProviderStream()
+
+        with patch.object(self.srv, "_STREAM_AFTER_FIRST_TOKEN_TIMEOUT_SEC", 0.01):
+            events = await self._collect_stream_events(fake_stream)
+
+        self.assertTrue(fake_stream.closed)
+        joined = "".join(events)
+        self.assertIn("message_stop", joined)
+        self.assertNotIn("event: error", joined)
+
+    async def test_timeout_marks_metrics_unsuccessful(self):
+        class FakeProviderStream:
+            def __init__(self):
+                self.closed = False
+
+            async def __aiter__(self):
+                yield (
+                    "data: "
+                    + json.dumps({
+                        "id": "x",
+                        "choices": [{"index": 0, "delta": {"content": "PONG"}, "finish_reason": None}],
+                    })
+                ).encode()
+                await asyncio.sleep(0.02)
+
+            async def aclose(self):
+                self.closed = True
+
+        fake_stream = FakeProviderStream()
+        self.srv._runtime_metrics.reset()
+        ctx = self.srv._runtime_metrics.start_request("provider-key", "provider-name", 0, True, input_tokens=0)
+
+        with patch.object(self.srv, "_STREAM_AFTER_FIRST_TOKEN_TIMEOUT_SEC", 0.01):
+            events = await self._collect_stream_events(fake_stream, metrics_ctx=ctx)
+
+        self.assertTrue(fake_stream.closed)
+        self.assertIn("event: error", events[-1])
+        self.assertEqual(self.srv._runtime_metrics.requests_completed, 0)
+        self.assertEqual(self.srv._runtime_metrics.requests_failed, 1)
+        self.assertEqual(self.srv._runtime_metrics.active_requests, 0)
+
+
 # ============================================================================
 # Unit — config + apply_provider_params
 # ============================================================================
