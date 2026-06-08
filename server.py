@@ -80,6 +80,7 @@ class DPRoutingDecision:
     dp_size: int | None = None
     rank: int | None = None
     provider_dp_rank: int | None = None
+    reservation_slot_id: str | None = None
     source: str | None = None
     sticky_key: str | None = None
     session_id: str | None = None
@@ -251,6 +252,8 @@ class DPAllocator:
 # Global allocator state per provider
 _dp_allocators: dict[str, DPAllocator] = {}
 _model_allocators: dict[str, StickySlotAllocator] = {}
+_routing_lock = threading.Lock()
+_routing_reservations: dict[str, int] = {}
 
 
 @dataclass
@@ -799,8 +802,10 @@ def set_config(cfg: dict, *, source_path: str | None = None) -> None:
     for task in _sglang_health_tasks.values():
         task.cancel()
     _sglang_health_tasks.clear()
-    _dp_allocators.clear()
-    _model_allocators.clear()
+    with _routing_lock:
+        _dp_allocators.clear()
+        _model_allocators.clear()
+        _routing_reservations.clear()
     _runtime_metrics.reset()
 
 
@@ -1084,11 +1089,13 @@ def _timeout() -> float:
     return float(_config.get("API_TIMEOUT_MS", 600_000)) / 1000
 
 
-def _provider_headers(provider: dict) -> dict:
+def _provider_headers(provider: dict, routed_dp_rank: int | None = None) -> dict:
     api_key = provider.get("api_key", "")
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    if routed_dp_rank is not None:
+        headers["X-Data-Parallel-Rank"] = str(routed_dp_rank)
     return headers
 
 
@@ -1228,6 +1235,37 @@ def _slot_loads_for_slots(slots: list[RoutingSlot]) -> dict[str, int]:
             provider_loads[slot.provider_key] = provider_load
         slot_loads[slot.slot_id] = provider_load
     return slot_loads
+
+
+def _slot_loads_with_reservations_locked(slots: list[RoutingSlot]) -> dict[str, int]:
+    slot_loads = _slot_loads_for_slots(slots)
+    for slot in slots:
+        slot_loads[slot.slot_id] = slot_loads.get(slot.slot_id, 0) + _routing_reservations.get(slot.slot_id, 0)
+    return slot_loads
+
+
+def _reserve_routing_slot_locked(slot_id: str) -> str:
+    _routing_reservations[slot_id] = _routing_reservations.get(slot_id, 0) + 1
+    return slot_id
+
+
+def _release_routing_reservation(slot_id: str | None) -> None:
+    if slot_id is None:
+        return
+    with _routing_lock:
+        count = _routing_reservations.get(slot_id, 0)
+        if count <= 1:
+            _routing_reservations.pop(slot_id, None)
+        else:
+            _routing_reservations[slot_id] = count - 1
+
+
+def _release_dp_routing_reservation(decision: DPRoutingDecision) -> None:
+    slot_id = decision.reservation_slot_id
+    if slot_id is None:
+        return
+    decision.reservation_slot_id = None
+    _release_routing_reservation(slot_id)
 
 
 async def _build_routing_slots(model: str, *, force_refresh: bool = False) -> list[RoutingSlot]:
@@ -1659,18 +1697,55 @@ async def _resolve_dp_routing(
     slots = await _build_routing_slots(model, force_refresh=force_refresh)
     if not slots:
         raise HTTPException(500, f"No routing slots available for model '{model}'")
-    slot_by_id = {slot.slot_id: slot for slot in slots}
-    slot_loads = _slot_loads_for_slots(slots)
 
-    override_rank = request.headers.get(_DP_OVERRIDE_HEADER)
-    if override_rank is not None:
-        try:
-            flat_rank = int(override_rank.strip())
-        except ValueError:
-            raise HTTPException(400, f"{_DP_OVERRIDE_HEADER} must be an integer")
-        if flat_rank < 0 or flat_rank >= len(slots):
-            raise HTTPException(400, f"{_DP_OVERRIDE_HEADER} must be in range [0, {len(slots)})")
-        selected_slot = slots[flat_rank]
+    with _routing_lock:
+        slot_by_id = {slot.slot_id: slot for slot in slots}
+        slot_loads = _slot_loads_with_reservations_locked(slots)
+
+        override_rank = request.headers.get(_DP_OVERRIDE_HEADER)
+        if override_rank is not None:
+            try:
+                flat_rank = int(override_rank.strip())
+            except ValueError:
+                raise HTTPException(400, f"{_DP_OVERRIDE_HEADER} must be an integer")
+            if flat_rank < 0 or flat_rank >= len(slots):
+                raise HTTPException(400, f"{_DP_OVERRIDE_HEADER} must be in range [0, {len(slots)})")
+            selected_slot = slots[flat_rank]
+            if selected_slot.provider_dp_rank is not None:
+                openai_req["routed_dp_rank"] = selected_slot.provider_dp_rank
+            decision = DPRoutingDecision(
+                provider_key=selected_slot.provider_key,
+                provider_name=selected_slot.provider_name,
+                dp_size=selected_slot.dp_size,
+                rank=selected_slot.flat_index,
+                provider_dp_rank=selected_slot.provider_dp_rank,
+                reservation_slot_id=_reserve_routing_slot_locked(selected_slot.slot_id),
+                source="override",
+            )
+            return selected_slot, openai_req, decision
+
+        session_id = request.headers.get(_CLAUDE_SESSION_HEADER)
+        if not session_id:
+            session_id = str(uuid.uuid4())
+
+        sticky_key, sticky_source, subagent_id = _derive_sticky_key(session_id, anthropic_req)
+
+        allocator = _get_or_create_model_allocator(model, slots)
+        slot_id, is_new = allocator.assign(sticky_key, slot_loads=slot_loads)
+        selected_slot = slot_by_id.get(slot_id)
+        if selected_slot is None:
+            allocator.sessions.pop(sticky_key, None)
+            allocator.session_activity.pop(sticky_key, None)
+            slot_id, is_new = allocator.assign(sticky_key, slot_loads=slot_loads)
+            selected_slot = slot_by_id[slot_id]
+        selected_slot, remapped = _maybe_reassign_busy_slot(
+            allocator,
+            sticky_key,
+            selected_slot,
+            slot_by_id,
+            slot_loads,
+        )
+
         if selected_slot.provider_dp_rank is not None:
             openai_req["routed_dp_rank"] = selected_slot.provider_dp_rank
         decision = DPRoutingDecision(
@@ -1679,45 +1754,13 @@ async def _resolve_dp_routing(
             dp_size=selected_slot.dp_size,
             rank=selected_slot.flat_index,
             provider_dp_rank=selected_slot.provider_dp_rank,
-            source="override",
+            reservation_slot_id=_reserve_routing_slot_locked(selected_slot.slot_id),
+            source=sticky_source,
+            sticky_key=sticky_key,
+            session_id=session_id,
+            subagent_id=subagent_id,
         )
-        return selected_slot, openai_req, decision
-
-    session_id = request.headers.get(_CLAUDE_SESSION_HEADER)
-    if not session_id:
-        session_id = str(uuid.uuid4())
-
-    sticky_key, sticky_source, subagent_id = _derive_sticky_key(session_id, anthropic_req)
-
-    allocator = _get_or_create_model_allocator(model, slots)
-    slot_id, is_new = allocator.assign(sticky_key, slot_loads=slot_loads)
-    selected_slot = slot_by_id.get(slot_id)
-    if selected_slot is None:
-        allocator.sessions.pop(sticky_key, None)
-        allocator.session_activity.pop(sticky_key, None)
-        slot_id, is_new = allocator.assign(sticky_key, slot_loads=slot_loads)
-        selected_slot = slot_by_id[slot_id]
-    selected_slot, remapped = _maybe_reassign_busy_slot(
-        allocator,
-        sticky_key,
-        selected_slot,
-        slot_by_id,
-        slot_loads,
-    )
-
-    if selected_slot.provider_dp_rank is not None:
-        openai_req["routed_dp_rank"] = selected_slot.provider_dp_rank
-    decision = DPRoutingDecision(
-        provider_key=selected_slot.provider_key,
-        provider_name=selected_slot.provider_name,
-        dp_size=selected_slot.dp_size,
-        rank=selected_slot.flat_index,
-        provider_dp_rank=selected_slot.provider_dp_rank,
-        source=sticky_source,
-        sticky_key=sticky_key,
-        session_id=session_id,
-        subagent_id=subagent_id,
-    )
+        total_sessions = len(allocator.sessions)
 
     logger.info(
         "Routing assign: model=%s provider=%s session=%s subagent_id=%s sticky_source=%s slot=%d provider_dp_rank=%s is_new=%s total_sessions=%d",
@@ -1729,7 +1772,7 @@ async def _resolve_dp_routing(
         selected_slot.flat_index,
         selected_slot.provider_dp_rank,
         is_new,
-        len(allocator.sessions),
+        total_sessions,
     )
     if remapped:
         logger.info(
@@ -1760,9 +1803,13 @@ async def _retry_message_request_for_invalid_rank(
     )
     if old_decision.source == "override" and new_decision.rank is None:
         raise HTTPException(400, f"{_DP_OVERRIDE_HEADER} is no longer valid after refreshing routing slots")
-    openai_req = apply_provider_params(selected_slot.provider, openai_req)
-    _log_dp_routing(selected_slot.provider, new_decision, remapped=(new_decision.rank != old_decision.rank))
-    log_openai_request(openai_req)
+    try:
+        openai_req = apply_provider_params(selected_slot.provider, openai_req)
+        _log_dp_routing(selected_slot.provider, new_decision, remapped=(new_decision.rank != old_decision.rank))
+        log_openai_request(openai_req)
+    except Exception:
+        _release_dp_routing_reservation(new_decision)
+        raise
     return selected_slot, openai_req, new_decision
 
 
@@ -1789,50 +1836,56 @@ async def _resolve_retry_routing(
     if not remaining_slots:
         raise NoProviderRetryLeft()
 
-    slot_by_id = {slot.slot_id: slot for slot in remaining_slots}
-    slot_loads = _slot_loads_for_slots(remaining_slots)
-    session_id = request.headers.get(_CLAUDE_SESSION_HEADER) or str(uuid.uuid4())
-    sticky_key, sticky_source, subagent_id = _derive_sticky_key(session_id, anthropic_req)
+    with _routing_lock:
+        slot_by_id = {slot.slot_id: slot for slot in remaining_slots}
+        slot_loads = _slot_loads_with_reservations_locked(remaining_slots)
+        session_id = request.headers.get(_CLAUDE_SESSION_HEADER) or str(uuid.uuid4())
+        sticky_key, sticky_source, subagent_id = _derive_sticky_key(session_id, anthropic_req)
 
-    allocator = _get_or_create_model_allocator(model, slots)
-    current_slot_id = allocator.sessions.get(sticky_key)
-    if current_slot_id in slot_by_id:
-        selected_slot = slot_by_id[current_slot_id]
-    else:
-        selected_slot = min(
-            remaining_slots,
-            key=lambda slot: (
-                int(slot_loads.get(slot.slot_id, 0)),
-                allocator.slot_last_used.get(slot.slot_id, 0.0),
-                slot.flat_index,
-            ),
+        allocator = _get_or_create_model_allocator(model, slots)
+        current_slot_id = allocator.sessions.get(sticky_key)
+        if current_slot_id in slot_by_id:
+            selected_slot = slot_by_id[current_slot_id]
+        else:
+            selected_slot = min(
+                remaining_slots,
+                key=lambda slot: (
+                    int(slot_loads.get(slot.slot_id, 0)),
+                    allocator.slot_last_used.get(slot.slot_id, 0.0),
+                    slot.flat_index,
+                ),
+            )
+            allocator.reassign(sticky_key, selected_slot.slot_id)
+
+        selected_slot, remapped = _maybe_reassign_busy_slot(
+            allocator,
+            sticky_key,
+            selected_slot,
+            slot_by_id,
+            slot_loads,
         )
-        allocator.reassign(sticky_key, selected_slot.slot_id)
 
-    selected_slot, remapped = _maybe_reassign_busy_slot(
-        allocator,
-        sticky_key,
-        selected_slot,
-        slot_by_id,
-        slot_loads,
-    )
-
-    if selected_slot.provider_dp_rank is not None:
-        openai_req["routed_dp_rank"] = selected_slot.provider_dp_rank
-    decision = DPRoutingDecision(
-        provider_key=selected_slot.provider_key,
-        provider_name=selected_slot.provider_name,
-        dp_size=selected_slot.dp_size,
-        rank=selected_slot.flat_index,
-        provider_dp_rank=selected_slot.provider_dp_rank,
-        source=sticky_source,
-        sticky_key=sticky_key,
-        session_id=session_id,
-        subagent_id=subagent_id,
-    )
-    openai_req = apply_provider_params(selected_slot.provider, openai_req)
-    _log_dp_routing(selected_slot.provider, decision, remapped=remapped)
-    log_openai_request(openai_req)
+        if selected_slot.provider_dp_rank is not None:
+            openai_req["routed_dp_rank"] = selected_slot.provider_dp_rank
+        decision = DPRoutingDecision(
+            provider_key=selected_slot.provider_key,
+            provider_name=selected_slot.provider_name,
+            dp_size=selected_slot.dp_size,
+            rank=selected_slot.flat_index,
+            provider_dp_rank=selected_slot.provider_dp_rank,
+            reservation_slot_id=_reserve_routing_slot_locked(selected_slot.slot_id),
+            source=sticky_source,
+            sticky_key=sticky_key,
+            session_id=session_id,
+            subagent_id=subagent_id,
+        )
+    try:
+        openai_req = apply_provider_params(selected_slot.provider, openai_req)
+        _log_dp_routing(selected_slot.provider, decision, remapped=remapped)
+        log_openai_request(openai_req)
+    except Exception:
+        _release_dp_routing_reservation(decision)
+        raise
     return selected_slot, openai_req, decision
 
 
@@ -2058,11 +2111,15 @@ async def messages(request: Request):
     provider = selected_slot.provider
     url = provider["api_base_url"]
     openai_req["priority"] = request_priority
-    openai_req = apply_provider_params(provider, openai_req)
-    _log_dp_routing(provider, dp_decision)
-    log_openai_request(openai_req)
+    try:
+        openai_req = apply_provider_params(provider, openai_req)
+        _log_dp_routing(provider, dp_decision)
+        log_openai_request(openai_req)
+    except Exception:
+        _release_dp_routing_reservation(dp_decision)
+        raise
 
-    headers = _provider_headers(provider)
+    headers = _provider_headers(provider, dp_decision.provider_dp_rank)
     max_retries: int = provider.get("max_retries", 3)
     timeout = _timeout()
     try:
@@ -2072,13 +2129,16 @@ async def messages(request: Request):
         input_tokens = 0
 
     is_stream = openai_req.get("stream", False)
-    metrics_ctx = _runtime_metrics.start_request(
-        provider_key=_dp_cache_key(provider),
-        provider_name=provider.get("name", ""),
-        dp_rank=dp_decision.provider_dp_rank,
-        is_stream=is_stream,
-        input_tokens=input_tokens,
-    )
+    try:
+        metrics_ctx = _runtime_metrics.start_request(
+            provider_key=_dp_cache_key(provider),
+            provider_name=provider.get("name", ""),
+            dp_rank=dp_decision.provider_dp_rank,
+            is_stream=is_stream,
+            input_tokens=input_tokens,
+        )
+    finally:
+        _release_dp_routing_reservation(dp_decision)
 
     if is_stream:
         # Eagerly connect to check provider status before committing to HTTP 200
@@ -2101,14 +2161,17 @@ async def messages(request: Request):
                     provider = selected_slot.provider
                     url = provider["api_base_url"]
                     openai_req["priority"] = request_priority
-                    headers = _provider_headers(provider)
+                    headers = _provider_headers(provider, dp_decision.provider_dp_rank)
                     max_retries = provider.get("max_retries", 3)
-                    _runtime_metrics.update_request_route(
-                        metrics_ctx,
-                        provider_key=_dp_cache_key(provider),
-                        provider_name=provider.get("name", ""),
-                        dp_rank=dp_decision.provider_dp_rank,
-                    )
+                    try:
+                        _runtime_metrics.update_request_route(
+                            metrics_ctx,
+                            provider_key=_dp_cache_key(provider),
+                            provider_name=provider.get("name", ""),
+                            dp_rank=dp_decision.provider_dp_rank,
+                        )
+                    finally:
+                        _release_dp_routing_reservation(dp_decision)
                     continue
                 if not _is_retryable_provider_failure(exc):
                     _log_provider_error(
@@ -2154,14 +2217,17 @@ async def messages(request: Request):
                 provider = selected_slot.provider
                 url = provider["api_base_url"]
                 openai_req["priority"] = request_priority
-                headers = _provider_headers(provider)
+                headers = _provider_headers(provider, dp_decision.provider_dp_rank)
                 max_retries = provider.get("max_retries", 3)
-                _runtime_metrics.update_request_route(
-                    metrics_ctx,
-                    provider_key=_dp_cache_key(provider),
-                    provider_name=provider.get("name", ""),
-                    dp_rank=dp_decision.provider_dp_rank,
-                )
+                try:
+                    _runtime_metrics.update_request_route(
+                        metrics_ctx,
+                        provider_key=_dp_cache_key(provider),
+                        provider_name=provider.get("name", ""),
+                        dp_rank=dp_decision.provider_dp_rank,
+                    )
+                finally:
+                    _release_dp_routing_reservation(dp_decision)
             except HTTPException:
                 _runtime_metrics.finish_request(metrics_ctx, success=False)
                 raise
@@ -2210,14 +2276,17 @@ async def messages(request: Request):
                 provider = selected_slot.provider
                 url = provider["api_base_url"]
                 openai_req["priority"] = request_priority
-                headers = _provider_headers(provider)
+                headers = _provider_headers(provider, dp_decision.provider_dp_rank)
                 max_retries = provider.get("max_retries", 3)
-                _runtime_metrics.update_request_route(
-                    metrics_ctx,
-                    provider_key=_dp_cache_key(provider),
-                    provider_name=provider.get("name", ""),
-                    dp_rank=dp_decision.provider_dp_rank,
-                )
+                try:
+                    _runtime_metrics.update_request_route(
+                        metrics_ctx,
+                        provider_key=_dp_cache_key(provider),
+                        provider_name=provider.get("name", ""),
+                        dp_rank=dp_decision.provider_dp_rank,
+                    )
+                finally:
+                    _release_dp_routing_reservation(dp_decision)
                 continue
             if not _is_retryable_provider_failure(exc):
                 _log_provider_error(
@@ -2277,14 +2346,17 @@ async def messages(request: Request):
         provider = selected_slot.provider
         url = provider["api_base_url"]
         openai_req["priority"] = request_priority
-        headers = _provider_headers(provider)
+        headers = _provider_headers(provider, dp_decision.provider_dp_rank)
         max_retries = provider.get("max_retries", 3)
-        _runtime_metrics.update_request_route(
-            metrics_ctx,
-            provider_key=_dp_cache_key(provider),
-            provider_name=provider.get("name", ""),
-            dp_rank=dp_decision.provider_dp_rank,
-        )
+        try:
+            _runtime_metrics.update_request_route(
+                metrics_ctx,
+                provider_key=_dp_cache_key(provider),
+                provider_name=provider.get("name", ""),
+                dp_rank=dp_decision.provider_dp_rank,
+            )
+        finally:
+            _release_dp_routing_reservation(dp_decision)
 
     check_and_save_nonstreaming(openai_req, openai_resp)
     anthropic_resp = openai_to_anthropic(openai_resp, model)

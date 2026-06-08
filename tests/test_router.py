@@ -2109,10 +2109,10 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
             return json.load(handle)
 
     async def test_messages_injects_session_rank_and_response_headers(self):
-        sent_bodies = []
+        sent_requests = []
 
         async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
-            sent_bodies.append(dict(body))
+            sent_requests.append((dict(headers), dict(body)))
             return self._openai_resp()
 
         session_id = "session-sticky"
@@ -2128,7 +2128,9 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertEqual(sent_bodies[0]["routed_dp_rank"], expected_rank)
+        sent_headers, sent_body = sent_requests[0]
+        self.assertEqual(sent_body["routed_dp_rank"], expected_rank)
+        self.assertEqual(sent_headers["X-Data-Parallel-Rank"], str(expected_rank))
         self.assertEqual(resp.headers["X-Router-DP-Rank"], str(expected_rank))
         self.assertEqual(resp.headers["X-Router-Sticky-Key"], session_id)
 
@@ -2638,6 +2640,45 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.headers["X-Router-Sticky-Key"], f"claude-session:{expected_first}")
         self.assertEqual(second.headers["X-Router-Sticky-Key"], f"claude-session:{expected_second}")
         self.assertEqual(third.headers["X-Router-Sticky-Key"], f"claude-session:{expected_first}")
+
+    async def test_concurrent_same_sticky_requests_reserve_slots_before_metrics_start(self):
+        sent_requests = []
+        request_count = 8
+        token_count_calls = 0
+        all_routed = asyncio.Event()
+
+        async def fake_count_tokens(provider, model, openai_req):
+            nonlocal token_count_calls
+            token_count_calls += 1
+            if token_count_calls == request_count:
+                all_routed.set()
+            await asyncio.wait_for(all_routed.wait(), timeout=5)
+            return 1, None
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_requests.append((dict(headers), dict(body)))
+            return self._openai_resp()
+
+        headers = {self.srv._CLAUDE_SESSION_HEADER: "claude-session"}
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=8)), \
+             patch.object(self.srv, "_count_request_input_tokens", new=AsyncMock(side_effect=fake_count_tokens)), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            responses = await asyncio.gather(*[
+                self.client.post("/v1/messages", json=self._subagent_messages_req(), headers=headers)
+                for _ in range(request_count)
+            ])
+
+        for resp in responses:
+            self.assertEqual(resp.status_code, 200, resp.text)
+
+        ranks = [body["routed_dp_rank"] for _, body in sent_requests]
+        rank_counts = {rank: ranks.count(rank) for rank in set(ranks)}
+        self.assertEqual(sum(rank_counts.values()), request_count)
+        self.assertGreater(len(rank_counts), 1)
+        self.assertLessEqual(max(rank_counts.values()), 2)
+        for sent_headers, sent_body in sent_requests:
+            self.assertEqual(sent_headers["X-Data-Parallel-Rank"], str(sent_body["routed_dp_rank"]))
+        self.assertEqual(self.srv._routing_reservations, {})
 
     async def test_reassigns_dp_rank_when_selected_rank_is_busy_and_another_is_idle(self):
         sent_bodies = []
