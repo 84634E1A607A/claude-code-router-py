@@ -1047,6 +1047,12 @@ def _rebuild_response(response: Response, body: bytes) -> Response:
     return rebuilt
 
 
+def _request_uses_handler_managed_hard_timeout(path: str) -> bool:
+    return path == "/v1/messages" or (
+        path.startswith("/v1/messages/batches/") and path.endswith("/results")
+    )
+
+
 @app.middleware("http")
 async def _dump_http_errors(request: Request, call_next):
     raw_body = await request.body()
@@ -1055,8 +1061,23 @@ async def _dump_http_errors(request: Request, call_next):
         return {"type": "http.request", "body": raw_body, "more_body": False}
 
     request = Request(request.scope, receive)
+    hard_deadline, hard_timeout_sec = _request_hard_timeout(request)
     try:
-        response = await call_next(request)
+        if _request_uses_handler_managed_hard_timeout(request.url.path):
+            response = await call_next(request)
+        else:
+            async with asyncio.timeout_at(hard_deadline):
+                response = await call_next(request)
+    except TimeoutError:
+        logger.warning(
+            "Hard timeout exceeded path=%s timeout_sec=%.1f",
+            request.url.path,
+            hard_timeout_sec,
+        )
+        response = JSONResponse(
+            status_code=504,
+            content={"detail": _hard_timeout_message(hard_timeout_sec)},
+        )
     except Exception as exc:
         request_dump, response_dump, dump_path = await _capture_http_error_for_response(
             request,
@@ -1087,6 +1108,42 @@ async def _dump_http_errors(request: Request, call_next):
 def _timeout() -> float:
     """Read API_TIMEOUT_MS from config, handling string or numeric values."""
     return float(_config.get("API_TIMEOUT_MS", 600_000)) / 1000
+
+
+def _hard_timeout() -> float:
+    """Read HARD_TIMEOUT_MS from config, handling string or numeric values."""
+    return float(_config.get("HARD_TIMEOUT_MS", 300_000)) / 1000
+
+
+def _format_timeout_seconds(timeout_sec: float) -> str:
+    if timeout_sec >= 10:
+        return f"{timeout_sec:.0f}"
+    return f"{timeout_sec:.1f}".rstrip("0").rstrip(".")
+
+
+def _hard_timeout_message(timeout_sec: float) -> str:
+    return f"Request exceeded hard timeout of {_format_timeout_seconds(timeout_sec)}s"
+
+
+def _request_hard_timeout(request: Request) -> tuple[float, float]:
+    timeout_sec = getattr(request.state, "hard_timeout_sec", None)
+    if timeout_sec is None:
+        timeout_sec = _hard_timeout()
+        request.state.hard_timeout_sec = timeout_sec
+
+    deadline = getattr(request.state, "hard_timeout_deadline", None)
+    if deadline is None:
+        deadline = asyncio.get_running_loop().time() + float(timeout_sec)
+        request.state.hard_timeout_deadline = deadline
+
+    return float(deadline), float(timeout_sec)
+
+
+def _earliest_deadline(*deadlines: float | None) -> float | None:
+    active = [deadline for deadline in deadlines if deadline is not None]
+    if not active:
+        return None
+    return min(active)
 
 
 def _provider_headers(provider: dict, routed_dp_rank: int | None = None) -> dict:
@@ -2087,93 +2144,248 @@ async def _count_tokens_via_sglang(provider: dict, model: str, prompt: str) -> i
 
 @app.post("/v1/messages")
 async def messages(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(400, "Invalid JSON body")
+    hard_deadline, hard_timeout_sec = _request_hard_timeout(request)
+    metrics_ctx: RequestMetricsContext | None = None
+    metrics_finished = False
+    metrics_handed_off = False
+    stream: ProviderStream | None = None
+    stream_handed_off = False
+
+    def _finish_metrics(success: bool, usage: dict | None = None) -> None:
+        nonlocal metrics_finished
+        if metrics_ctx is None or metrics_finished:
+            return
+        _runtime_metrics.finish_request(metrics_ctx, success=success, usage=usage)
+        metrics_finished = True
 
     try:
-        model = _resolve_request_model((body or {}).get("model"))
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("Routing error")
-        raise HTTPException(500, str(exc))
-
-    # Override model in the original request so converter uses the routed model
-    body = dict(body)
-    body["model"] = model
-    request_priority = _resolve_request_priority(request, body)
-
-    # Anthropic → OpenAI, then apply provider param defaults
-    base_openai_req = anthropic_to_openai(body)
-    selected_slot, openai_req, dp_decision = await _resolve_dp_routing(request, model, body, base_openai_req)
-    provider = selected_slot.provider
-    url = provider["api_base_url"]
-    openai_req["priority"] = request_priority
-    try:
-        openai_req = apply_provider_params(provider, openai_req)
-        _log_dp_routing(provider, dp_decision)
-        log_openai_request(openai_req)
-    except Exception:
-        _release_dp_routing_reservation(dp_decision)
-        raise
-
-    headers = _provider_headers(provider, dp_decision.provider_dp_rank)
-    max_retries: int = provider.get("max_retries", 3)
-    timeout = _timeout()
-    try:
-        input_tokens, _ = await _count_request_input_tokens(provider, model, openai_req)
-    except Exception:
-        logger.exception("Realtime input token counting failed")
-        input_tokens = 0
-
-    is_stream = openai_req.get("stream", False)
-    try:
-        metrics_ctx = _runtime_metrics.start_request(
-            provider_key=_dp_cache_key(provider),
-            provider_name=provider.get("name", ""),
-            dp_rank=dp_decision.provider_dp_rank,
-            is_stream=is_stream,
-            input_tokens=input_tokens,
-        )
-    finally:
-        _release_dp_routing_reservation(dp_decision)
-
-    if is_stream:
-        # Eagerly connect to check provider status before committing to HTTP 200
-        attempted_provider_keys: set[str] = set()
-        last_provider_error: ProviderError | None = None
-        while True:
+        async with asyncio.timeout_at(hard_deadline):
             try:
-                stream = await open_provider_stream(url, headers, openai_req, timeout, max_retries)
-                break
-            except ProviderError as exc:
-                last_provider_error = exc
-                if _is_invalid_dp_rank_error(exc) and dp_decision.rank is not None:
-                    selected_slot, openai_req, dp_decision = await _retry_message_request_for_invalid_rank(
-                        request,
-                        model,
-                        body,
-                        base_openai_req,
-                        dp_decision,
-                    )
-                    provider = selected_slot.provider
-                    url = provider["api_base_url"]
-                    openai_req["priority"] = request_priority
-                    headers = _provider_headers(provider, dp_decision.provider_dp_rank)
-                    max_retries = provider.get("max_retries", 3)
+                body = await request.json()
+            except Exception:
+                raise HTTPException(400, "Invalid JSON body")
+
+            try:
+                model = _resolve_request_model((body or {}).get("model"))
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.exception("Routing error")
+                raise HTTPException(500, str(exc))
+
+            # Override model in the original request so converter uses the routed model
+            body = dict(body)
+            body["model"] = model
+            request_priority = _resolve_request_priority(request, body)
+
+            # Anthropic → OpenAI, then apply provider param defaults
+            base_openai_req = anthropic_to_openai(body)
+            selected_slot, openai_req, dp_decision = await _resolve_dp_routing(request, model, body, base_openai_req)
+            provider = selected_slot.provider
+            url = provider["api_base_url"]
+            openai_req["priority"] = request_priority
+            try:
+                openai_req = apply_provider_params(provider, openai_req)
+                _log_dp_routing(provider, dp_decision)
+                log_openai_request(openai_req)
+            except Exception:
+                _release_dp_routing_reservation(dp_decision)
+                raise
+
+            headers = _provider_headers(provider, dp_decision.provider_dp_rank)
+            max_retries: int = provider.get("max_retries", 3)
+            timeout = _timeout()
+            try:
+                input_tokens, _ = await _count_request_input_tokens(provider, model, openai_req)
+            except Exception:
+                logger.exception("Realtime input token counting failed")
+                input_tokens = 0
+
+            is_stream = openai_req.get("stream", False)
+            try:
+                metrics_ctx = _runtime_metrics.start_request(
+                    provider_key=_dp_cache_key(provider),
+                    provider_name=provider.get("name", ""),
+                    dp_rank=dp_decision.provider_dp_rank,
+                    is_stream=is_stream,
+                    input_tokens=input_tokens,
+                )
+            finally:
+                _release_dp_routing_reservation(dp_decision)
+
+            if is_stream:
+                # Eagerly connect to check provider status before committing to HTTP 200
+                attempted_provider_keys: set[str] = set()
+                last_provider_error: ProviderError | None = None
+                while True:
                     try:
-                        _runtime_metrics.update_request_route(
-                            metrics_ctx,
-                            provider_key=_dp_cache_key(provider),
-                            provider_name=provider.get("name", ""),
-                            dp_rank=dp_decision.provider_dp_rank,
+                        stream = await open_provider_stream(url, headers, openai_req, timeout, max_retries)
+                        break
+                    except ProviderError as exc:
+                        last_provider_error = exc
+                        if _is_invalid_dp_rank_error(exc) and dp_decision.rank is not None:
+                            selected_slot, openai_req, dp_decision = await _retry_message_request_for_invalid_rank(
+                                request,
+                                model,
+                                body,
+                                base_openai_req,
+                                dp_decision,
+                            )
+                            provider = selected_slot.provider
+                            url = provider["api_base_url"]
+                            openai_req["priority"] = request_priority
+                            headers = _provider_headers(provider, dp_decision.provider_dp_rank)
+                            max_retries = provider.get("max_retries", 3)
+                            try:
+                                _runtime_metrics.update_request_route(
+                                    metrics_ctx,
+                                    provider_key=_dp_cache_key(provider),
+                                    provider_name=provider.get("name", ""),
+                                    dp_rank=dp_decision.provider_dp_rank,
+                                )
+                            finally:
+                                _release_dp_routing_reservation(dp_decision)
+                            continue
+                        if not _is_retryable_provider_failure(exc):
+                            _log_provider_error(
+                                provider,
+                                url,
+                                model,
+                                headers,
+                                openai_req,
+                                exc,
+                                retrying=False,
+                                dp_decision=dp_decision,
+                            )
+                            _finish_metrics(success=False)
+                            raise HTTPException(exc.status or 502, exc.body or str(exc))
+                        _log_provider_error(
+                            provider,
+                            url,
+                            model,
+                            headers,
+                            openai_req,
+                            exc,
+                            retrying=True,
+                            dp_decision=dp_decision,
                         )
-                    finally:
-                        _release_dp_routing_reservation(dp_decision)
-                    continue
-                if not _is_retryable_provider_failure(exc):
+                        attempted_provider_keys.add(_dp_cache_key(provider))
+                    except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
+                        logger.warning(
+                            "Provider stream connection failed, trying another provider if available: %s",
+                            exc,
+                        )
+                        attempted_provider_keys.add(_dp_cache_key(provider))
+                    except Exception as exc:
+                        logger.exception("Stream connection error")
+                        _finish_metrics(success=False)
+                        raise HTTPException(502, str(exc))
+
+                    try:
+                        selected_slot, openai_req, dp_decision = await _resolve_retry_routing(
+                            request,
+                            model,
+                            body,
+                            base_openai_req,
+                            attempted_provider_keys,
+                            force_refresh=True,
+                        )
+                        provider = selected_slot.provider
+                        url = provider["api_base_url"]
+                        openai_req["priority"] = request_priority
+                        headers = _provider_headers(provider, dp_decision.provider_dp_rank)
+                        max_retries = provider.get("max_retries", 3)
+                        try:
+                            _runtime_metrics.update_request_route(
+                                metrics_ctx,
+                                provider_key=_dp_cache_key(provider),
+                                provider_name=provider.get("name", ""),
+                                dp_rank=dp_decision.provider_dp_rank,
+                            )
+                        finally:
+                            _release_dp_routing_reservation(dp_decision)
+                    except HTTPException:
+                        _finish_metrics(success=False)
+                        raise
+                    except NoProviderRetryLeft:
+                        if last_provider_error is not None:
+                            _log_provider_error(
+                                provider,
+                                url,
+                                model,
+                                headers,
+                                openai_req,
+                                last_provider_error,
+                                retrying=False,
+                                dp_decision=dp_decision,
+                            )
+                        _finish_metrics(success=False)
+                        raise HTTPException(502, "All configured providers are unavailable")
+
+                metrics_handed_off = True
+                stream_handed_off = True
+                return StreamingResponse(
+                    _stream_response(
+                        openai_req,
+                        stream,
+                        model,
+                        metrics_ctx=metrics_ctx,
+                        hard_deadline=hard_deadline,
+                        hard_timeout_sec=hard_timeout_sec,
+                    ),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "X-Accel-Buffering": "no",
+                        **dp_decision.response_headers(),
+                    },
+                )
+
+            # Non-streaming
+            attempted_provider_keys: set[str] = set()
+            last_provider_error: ProviderError | None = None
+            while True:
+                try:
+                    openai_resp = await post_json(url, headers, openai_req, timeout=timeout, max_retries=max_retries)
+                    break
+                except ProviderError as exc:
+                    last_provider_error = exc
+                    if _is_invalid_dp_rank_error(exc) and dp_decision.rank is not None:
+                        selected_slot, openai_req, dp_decision = await _retry_message_request_for_invalid_rank(
+                            request,
+                            model,
+                            body,
+                            base_openai_req,
+                            dp_decision,
+                        )
+                        provider = selected_slot.provider
+                        url = provider["api_base_url"]
+                        openai_req["priority"] = request_priority
+                        headers = _provider_headers(provider, dp_decision.provider_dp_rank)
+                        max_retries = provider.get("max_retries", 3)
+                        try:
+                            _runtime_metrics.update_request_route(
+                                metrics_ctx,
+                                provider_key=_dp_cache_key(provider),
+                                provider_name=provider.get("name", ""),
+                                dp_rank=dp_decision.provider_dp_rank,
+                            )
+                        finally:
+                            _release_dp_routing_reservation(dp_decision)
+                        continue
+                    if not _is_retryable_provider_failure(exc):
+                        _log_provider_error(
+                            provider,
+                            url,
+                            model,
+                            headers,
+                            openai_req,
+                            exc,
+                            retrying=False,
+                            dp_decision=dp_decision,
+                        )
+                        _finish_metrics(success=False)
+                        raise HTTPException(exc.status or 502, exc.body or str(exc))
                     _log_provider_error(
                         provider,
                         url,
@@ -2181,98 +2393,41 @@ async def messages(request: Request):
                         headers,
                         openai_req,
                         exc,
-                        retrying=False,
+                        retrying=True,
                         dp_decision=dp_decision,
                     )
-                    _runtime_metrics.finish_request(metrics_ctx, success=False)
-                    raise HTTPException(exc.status or 502, exc.body or str(exc))
-                _log_provider_error(
-                    provider,
-                    url,
-                    model,
-                    headers,
-                    openai_req,
-                    exc,
-                    retrying=True,
-                    dp_decision=dp_decision,
-                )
-                attempted_provider_keys.add(_dp_cache_key(provider))
-            except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
-                logger.warning("Provider stream connection failed, trying another provider if available: %s", exc)
-                attempted_provider_keys.add(_dp_cache_key(provider))
-            except Exception as exc:
-                logger.exception("Stream connection error")
-                _runtime_metrics.finish_request(metrics_ctx, success=False)
-                raise HTTPException(502, str(exc))
+                    attempted_provider_keys.add(_dp_cache_key(provider))
+                except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
+                    logger.warning("Provider connection failed, trying another provider if available: %s", exc)
+                    attempted_provider_keys.add(_dp_cache_key(provider))
+                except Exception as exc:
+                    logger.exception("Unexpected error calling provider")
+                    _finish_metrics(success=False)
+                    raise HTTPException(502, str(exc))
 
-            try:
-                selected_slot, openai_req, dp_decision = await _resolve_retry_routing(
-                    request,
-                    model,
-                    body,
-                    base_openai_req,
-                    attempted_provider_keys,
-                    force_refresh=True,
-                )
-                provider = selected_slot.provider
-                url = provider["api_base_url"]
-                openai_req["priority"] = request_priority
-                headers = _provider_headers(provider, dp_decision.provider_dp_rank)
-                max_retries = provider.get("max_retries", 3)
                 try:
-                    _runtime_metrics.update_request_route(
-                        metrics_ctx,
-                        provider_key=_dp_cache_key(provider),
-                        provider_name=provider.get("name", ""),
-                        dp_rank=dp_decision.provider_dp_rank,
-                    )
-                finally:
-                    _release_dp_routing_reservation(dp_decision)
-            except HTTPException:
-                _runtime_metrics.finish_request(metrics_ctx, success=False)
-                raise
-            except NoProviderRetryLeft:
-                if last_provider_error is not None:
-                    _log_provider_error(
-                        provider,
-                        url,
+                    selected_slot, openai_req, dp_decision = await _resolve_retry_routing(
+                        request,
                         model,
-                        headers,
-                        openai_req,
-                        last_provider_error,
-                        retrying=False,
-                        dp_decision=dp_decision,
+                        body,
+                        base_openai_req,
+                        attempted_provider_keys,
+                        force_refresh=True,
                     )
-                _runtime_metrics.finish_request(metrics_ctx, success=False)
-                raise HTTPException(502, "All configured providers are unavailable")
-
-        return StreamingResponse(
-            _stream_response(openai_req, stream, model, metrics_ctx=metrics_ctx),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-                **dp_decision.response_headers(),
-            },
-        )
-
-    # Non-streaming
-    attempted_provider_keys: set[str] = set()
-    last_provider_error: ProviderError | None = None
-    while True:
-        try:
-            openai_resp = await post_json(url, headers, openai_req, timeout=timeout, max_retries=max_retries)
-            break
-        except ProviderError as exc:
-            last_provider_error = exc
-            if _is_invalid_dp_rank_error(exc) and dp_decision.rank is not None:
-                selected_slot, openai_req, dp_decision = await _retry_message_request_for_invalid_rank(
-                    request,
-                    model,
-                    body,
-                    base_openai_req,
-                    dp_decision,
-                )
+                except NoProviderRetryLeft:
+                    if last_provider_error is not None:
+                        _log_provider_error(
+                            provider,
+                            url,
+                            model,
+                            headers,
+                            openai_req,
+                            last_provider_error,
+                            retrying=False,
+                            dp_decision=dp_decision,
+                        )
+                    _finish_metrics(success=False)
+                    raise HTTPException(502, "All configured providers are unavailable")
                 provider = selected_slot.provider
                 url = provider["api_base_url"]
                 openai_req["priority"] = request_priority
@@ -2287,85 +2442,28 @@ async def messages(request: Request):
                     )
                 finally:
                     _release_dp_routing_reservation(dp_decision)
-                continue
-            if not _is_retryable_provider_failure(exc):
-                _log_provider_error(
-                    provider,
-                    url,
-                    model,
-                    headers,
-                    openai_req,
-                    exc,
-                    retrying=False,
-                    dp_decision=dp_decision,
-                )
-                _runtime_metrics.finish_request(metrics_ctx, success=False)
-                raise HTTPException(exc.status or 502, exc.body or str(exc))
-            _log_provider_error(
-                provider,
-                url,
-                model,
-                headers,
-                openai_req,
-                exc,
-                retrying=True,
-                dp_decision=dp_decision,
-            )
-            attempted_provider_keys.add(_dp_cache_key(provider))
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
-            logger.warning("Provider connection failed, trying another provider if available: %s", exc)
-            attempted_provider_keys.add(_dp_cache_key(provider))
-        except Exception as exc:
-            logger.exception("Unexpected error calling provider")
-            _runtime_metrics.finish_request(metrics_ctx, success=False)
-            raise HTTPException(502, str(exc))
 
-        try:
-            selected_slot, openai_req, dp_decision = await _resolve_retry_routing(
-                request,
-                model,
-                body,
-                base_openai_req,
-                attempted_provider_keys,
-                force_refresh=True,
+            check_and_save_nonstreaming(openai_req, openai_resp)
+            anthropic_resp = openai_to_anthropic(openai_resp, model)
+            _finish_metrics(
+                success=True,
+                usage=_usage_from_anthropic_message(anthropic_resp) or _normalize_openai_usage(openai_resp.get("usage")),
             )
-        except NoProviderRetryLeft:
-            if last_provider_error is not None:
-                _log_provider_error(
-                    provider,
-                    url,
-                    model,
-                    headers,
-                    openai_req,
-                    last_provider_error,
-                    retrying=False,
-                    dp_decision=dp_decision,
-                )
-            _runtime_metrics.finish_request(metrics_ctx, success=False)
-            raise HTTPException(502, "All configured providers are unavailable")
-        provider = selected_slot.provider
-        url = provider["api_base_url"]
-        openai_req["priority"] = request_priority
-        headers = _provider_headers(provider, dp_decision.provider_dp_rank)
-        max_retries = provider.get("max_retries", 3)
-        try:
-            _runtime_metrics.update_request_route(
-                metrics_ctx,
-                provider_key=_dp_cache_key(provider),
-                provider_name=provider.get("name", ""),
-                dp_rank=dp_decision.provider_dp_rank,
-            )
-        finally:
-            _release_dp_routing_reservation(dp_decision)
-
-    check_and_save_nonstreaming(openai_req, openai_resp)
-    anthropic_resp = openai_to_anthropic(openai_resp, model)
-    _runtime_metrics.finish_request(
-        metrics_ctx,
-        success=True,
-        usage=_usage_from_anthropic_message(anthropic_resp) or _normalize_openai_usage(openai_resp.get("usage")),
-    )
-    return JSONResponse(content=anthropic_resp, headers=dp_decision.response_headers())
+            return JSONResponse(content=anthropic_resp, headers=dp_decision.response_headers())
+    except TimeoutError:
+        if stream is not None and not stream_handed_off:
+            try:
+                await stream.aclose()
+            except Exception:
+                logger.debug("Failed to close timed out provider stream", exc_info=True)
+        if not metrics_handed_off:
+            _finish_metrics(success=False)
+        logger.warning(
+            "Hard timeout exceeded path=%s timeout_sec=%.1f",
+            request.url.path,
+            hard_timeout_sec,
+        )
+        raise HTTPException(504, _hard_timeout_message(hard_timeout_sec))
 
 
 async def _stream_response(
@@ -2373,6 +2471,8 @@ async def _stream_response(
     stream: ProviderStream,
     model: str,
     metrics_ctx: RequestMetricsContext | None = None,
+    hard_deadline: float | None = None,
+    hard_timeout_sec: float | None = None,
 ) -> AsyncIterator[str]:
     import json as _json
     from debug import is_enabled as _debug_enabled
@@ -2390,14 +2490,31 @@ async def _stream_response(
     try:
         while True:
             try:
-                if stream_deadline is None:
+                wait_deadline = _earliest_deadline(stream_deadline, hard_deadline)
+                if wait_deadline is None:
                     event = await anext(event_iter)
                 else:
-                    async with asyncio.timeout_at(stream_deadline):
+                    async with asyncio.timeout_at(wait_deadline):
                         event = await anext(event_iter)
             except StopAsyncIteration:
                 break
             except TimeoutError:
+                now = asyncio.get_running_loop().time()
+                if hard_deadline is not None and now >= hard_deadline:
+                    timeout_display = hard_timeout_sec if hard_timeout_sec is not None else _hard_timeout()
+                    message = _hard_timeout_message(timeout_display)
+                    logger.warning(
+                        "Hard timeout exceeded for streaming response model=%s message_id=%s timeout_sec=%.1f",
+                        model,
+                        message_id,
+                        timeout_display,
+                    )
+                    error_event = {
+                        "type": "error",
+                        "error": {"type": "api_error", "message": message},
+                    }
+                    yield f"event: error\ndata: {_json.dumps(error_event)}\n\n"
+                    return
                 logger.warning(
                     "Streaming timeout after first content model=%s message_id=%s timeout_sec=%.1f",
                     model,
@@ -2895,22 +3012,33 @@ async def delete_batch(batch_id: str):
 @app.get("/v1/messages/batches/{batch_id}/results")
 async def batch_results(batch_id: str, request: Request):
     """Stream batch results as Anthropic JSONL (one result per line)."""
+    hard_deadline, hard_timeout_sec = _request_hard_timeout(request)
     try:
-        model = _resolve_routed_model()
-        provider = (await _select_deterministic_provider(model)).provider
-    except HTTPException:
-        raise
+        async with asyncio.timeout_at(hard_deadline):
+            try:
+                model = _resolve_routed_model()
+                provider = (await _select_deterministic_provider(model)).provider
+            except HTTPException:
+                raise
 
-    headers = _provider_headers(provider)
-    timeout = _timeout()
+            headers = _provider_headers(provider)
+            timeout = _timeout()
 
-    # Get the batch to find output_file_id
-    try:
-        batch = await _httpx_get(_batches_url(provider) + f"/{batch_id}", headers, timeout)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(502, str(exc))
+            # Get the batch to find output_file_id
+            try:
+                batch = await _httpx_get(_batches_url(provider) + f"/{batch_id}", headers, timeout)
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(502, str(exc))
+    except TimeoutError:
+        logger.warning(
+            "Hard timeout exceeded path=%s batch_id=%s timeout_sec=%.1f",
+            request.url.path,
+            batch_id,
+            hard_timeout_sec,
+        )
+        raise HTTPException(504, _hard_timeout_message(hard_timeout_sec))
 
     file_id = batch.get("output_file_id")
     if not file_id:
@@ -2919,27 +3047,41 @@ async def batch_results(batch_id: str, request: Request):
 
     async def _stream_results():
         url = _files_url(provider) + f"/{file_id}/content"
-        async with httpx.AsyncClient(timeout=upstream_timeout(timeout), trust_env=False) as client:
-            async with client.stream("GET", url, headers=headers) as resp:
-                if resp.status_code >= 400:
-                    body = await resp.aread()
-                    yield json.dumps({
-                        "type": "error",
-                        "error": {"type": "api_error", "message": body.decode()},
-                    }) + "\n"
-                    return
-                buffer = ""
-                async for chunk in resp.aiter_text():
-                    buffer += chunk
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        converted = openai_results_line_to_anthropic(line, model)
-                        if converted:
-                            yield converted + "\n"
-                if buffer.strip():
-                    converted = openai_results_line_to_anthropic(buffer, model)
-                    if converted:
-                        yield converted + "\n"
+        try:
+            async with asyncio.timeout_at(hard_deadline):
+                async with httpx.AsyncClient(timeout=upstream_timeout(timeout), trust_env=False) as client:
+                    async with client.stream("GET", url, headers=headers) as resp:
+                        if resp.status_code >= 400:
+                            body = await resp.aread()
+                            yield json.dumps({
+                                "type": "error",
+                                "error": {"type": "api_error", "message": body.decode()},
+                            }) + "\n"
+                            return
+                        buffer = ""
+                        async for chunk in resp.aiter_text():
+                            buffer += chunk
+                            while "\n" in buffer:
+                                line, buffer = buffer.split("\n", 1)
+                                converted = openai_results_line_to_anthropic(line, model)
+                                if converted:
+                                    yield converted + "\n"
+                        if buffer.strip():
+                            converted = openai_results_line_to_anthropic(buffer, model)
+                            if converted:
+                                yield converted + "\n"
+        except TimeoutError:
+            logger.warning(
+                "Hard timeout exceeded path=%s batch_id=%s timeout_sec=%.1f",
+                request.url.path,
+                batch_id,
+                hard_timeout_sec,
+            )
+            yield json.dumps({
+                "type": "error",
+                "error": {"type": "api_error", "message": _hard_timeout_message(hard_timeout_sec)},
+            }) + "\n"
+            return
 
     return StreamingResponse(
         _stream_results(),

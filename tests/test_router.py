@@ -962,6 +962,29 @@ class TestConfig(unittest.TestCase):
         })
         self.assertTrue(cfg["Providers"][0]["sglang_generate_health_check"])
 
+    def test_validate_config_defaults_hard_timeout(self):
+        cfg = validate_config({
+            "Providers": [{
+                "name": "foo",
+                "model": "/model",
+                "api_base_url": "http://host/v1/chat/completions",
+            }],
+            "Router": {"default": "/model"},
+        })
+        self.assertEqual(cfg["HARD_TIMEOUT_MS"], 300_000)
+
+    def test_validate_config_accepts_explicit_hard_timeout(self):
+        cfg = validate_config({
+            "HARD_TIMEOUT_MS": 12345,
+            "Providers": [{
+                "name": "foo",
+                "model": "/model",
+                "api_base_url": "http://host/v1/chat/completions",
+            }],
+            "Router": {"default": "/model"},
+        })
+        self.assertEqual(cfg["HARD_TIMEOUT_MS"], 12345)
+
 class TestApplyProviderParams(unittest.TestCase):
 
     def _p(self, params):
@@ -3186,6 +3209,208 @@ class TestMessagesDPRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertNotIn("routed_dp_rank", sent_bodies[0])
         fake_dp_size.assert_not_awaited()
+
+
+# ============================================================================
+# Unit — hard request timeouts
+# ============================================================================
+
+class TestHardRequestTimeouts(unittest.IsolatedAsyncioTestCase):
+
+    async def asyncSetUp(self):
+        import server as srv_mod
+
+        self.srv = srv_mod
+        self.error_dump_dir = tempfile.TemporaryDirectory()
+        self.error_dump_env = patch.dict(
+            os.environ,
+            {"CCR_ERROR_DUMP_DIR": self.error_dump_dir.name},
+            clear=False,
+        )
+        self.error_dump_env.start()
+        srv_mod.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "HARD_TIMEOUT_MS": 100,
+            "Providers": [{
+                "name": "sglang",
+                "model": "/model",
+                "api_base_url": "http://host:8000/v1/chat/completions",
+                "api_key": "k",
+                "max_retries": 1,
+            }],
+            "Router": {"default": "/model"},
+        })
+
+        from httpx import ASGITransport, AsyncClient
+        self.client = AsyncClient(
+            transport=ASGITransport(app=srv_mod.app),
+            base_url="http://test",
+            timeout=60.0,
+        )
+
+    async def asyncTearDown(self):
+        await self.client.aclose()
+        self.srv.set_config({})
+        self.error_dump_env.stop()
+        self.error_dump_dir.cleanup()
+
+    def _messages_req(self, extra=None):
+        req = {
+            "model": "default",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "Reply with exactly: PONG"}],
+        }
+        if extra:
+            req.update(extra)
+        return req
+
+    async def test_messages_nonstream_hard_timeout_returns_504_and_finishes_metrics(self):
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            await asyncio.sleep(0.2)
+            return {
+                "id": "chatcmpl-test",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "PONG"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1},
+            }
+
+        with patch.object(self.srv, "_count_request_input_tokens", new=AsyncMock(return_value=(0, None))), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            resp = await self.client.post("/v1/messages", json=self._messages_req())
+
+        self.assertEqual(resp.status_code, 504, resp.text)
+        self.assertIn("hard timeout", resp.text)
+        self.assertEqual(self.srv._runtime_metrics.requests_failed, 1)
+        self.assertEqual(self.srv._runtime_metrics.requests_completed, 0)
+        self.assertEqual(self.srv._runtime_metrics.active_requests, 0)
+
+    async def test_messages_stream_hard_timeout_emits_error_and_closes_upstream(self):
+        class FakeProviderStream:
+            def __init__(self):
+                self.closed = False
+
+            async def __aiter__(self):
+                yield (
+                    "data: "
+                    + json.dumps({
+                        "id": "x",
+                        "choices": [{"index": 0, "delta": {"content": "PONG"}, "finish_reason": None}],
+                    })
+                ).encode()
+                await asyncio.sleep(0.2)
+                yield b"data: [DONE]"
+
+            async def aclose(self):
+                self.closed = True
+
+        fake_stream = FakeProviderStream()
+
+        with patch.object(self.srv, "_count_request_input_tokens", new=AsyncMock(return_value=(0, None))), \
+             patch.object(self.srv, "open_provider_stream", new=AsyncMock(return_value=fake_stream)):
+            resp = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req({"stream": True}),
+                headers={"Accept": "text/event-stream"},
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertTrue(fake_stream.closed)
+        self.assertIn("event: error", resp.text)
+        self.assertIn("hard timeout", resp.text)
+        self.assertNotIn("message_stop", resp.text)
+        self.assertEqual(self.srv._runtime_metrics.requests_failed, 1)
+        self.assertEqual(self.srv._runtime_metrics.requests_completed, 0)
+        self.assertEqual(self.srv._runtime_metrics.active_requests, 0)
+
+    async def test_legacy_complete_hard_timeout_returns_504(self):
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            await asyncio.sleep(0.2)
+            return {
+                "id": "chatcmpl-test",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "PONG"},
+                    "finish_reason": "stop",
+                }],
+            }
+
+        with patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            resp = await self.client.post(
+                "/v1/complete",
+                json={
+                    "model": "default",
+                    "prompt": "\n\nHuman: Reply with exactly: PONG\n\nAssistant:",
+                    "max_tokens_to_sample": 32,
+                },
+            )
+
+        self.assertEqual(resp.status_code, 504, resp.text)
+        self.assertIn("hard timeout", resp.text)
+
+    async def test_batch_results_stream_hard_timeout_emits_jsonl_error(self):
+        responses = []
+
+        class FakeStreamResponse:
+            def __init__(self):
+                self.status_code = 200
+                self.closed = False
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                self.closed = True
+
+            async def aread(self):
+                return b""
+
+            async def aiter_text(self):
+                yield json.dumps({
+                    "id": "r1",
+                    "custom_id": "req-1",
+                    "response": {
+                        "status_code": 200,
+                        "body": {
+                            "id": "chatcmpl-test",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "Hi!"},
+                                "finish_reason": "stop",
+                            }],
+                            "usage": {"prompt_tokens": 5, "completion_tokens": 2},
+                        },
+                    },
+                    "error": None,
+                }) + "\n"
+                await asyncio.sleep(0.2)
+
+        class FakeAsyncClient:
+            def __init__(self, *args, **kwargs):
+                self.response = FakeStreamResponse()
+                responses.append(self.response)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def stream(self, method, url, headers=None):
+                return self.response
+
+        with patch.object(self.srv, "_httpx_get", new=AsyncMock(return_value={"output_file_id": "file-1"})), \
+             patch.object(self.srv.httpx, "AsyncClient", new=FakeAsyncClient):
+            resp = await self.client.get("/v1/messages/batches/batch-1/results")
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertTrue(responses[0].closed)
+        lines = [json.loads(line) for line in resp.text.splitlines() if line.strip()]
+        self.assertEqual(lines[0]["result"]["type"], "succeeded")
+        self.assertEqual(lines[-1]["type"], "error")
+        self.assertIn("hard timeout", lines[-1]["error"]["message"])
 
 
 # ============================================================================

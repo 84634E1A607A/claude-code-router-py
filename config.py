@@ -127,6 +127,7 @@ class ConfigModel(BaseModel):
 
     PORT: int = 3456
     API_TIMEOUT_MS: int = 600_000
+    HARD_TIMEOUT_MS: int = Field(default=300_000, gt=0)
     tokenizer_path: str | None = None
     Providers: list[ProviderConfig] = Field(min_length=1)
     Router: RouterConfig

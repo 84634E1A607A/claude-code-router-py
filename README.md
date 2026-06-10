@@ -91,6 +91,8 @@ gunicorn server:app \
   -e CCR_CONFIG=config.json
 ```
 
+`gunicorn --timeout` 应该大于 `HARD_TIMEOUT_MS / 1000`，留一点余量，避免外层进程比路由器更早断开连接。
+
 ## CLI
 
 ```bash
@@ -107,6 +109,7 @@ python main.py [--config PATH]
 {
   "PORT": 3456,
   "API_TIMEOUT_MS": 120000,
+  "HARD_TIMEOUT_MS": 300000,
   "tokenizer_path": "/models/default-tokenizer",
   "Providers": [
     {
@@ -142,7 +145,8 @@ python main.py [--config PATH]
 | Field | Type | Default | Purpose |
 |---|---|---|---|
 | `PORT` | `int` | `3456` | `main.py` 监听端口 |
-| `API_TIMEOUT_MS` | `int` | `600000` | 上游请求超时 |
+| `API_TIMEOUT_MS` | `int` | `600000` | 单次上游 HTTP 操作超时 |
+| `HARD_TIMEOUT_MS` | `int` | `300000` | 整个客户端请求的硬超时；超时后强制关闭连接 |
 | `tokenizer_path` | `string` | `null` | 默认 tokenizer 路径 |
 | `Providers` | `list` | required | provider 列表 |
 | `Router` | `object` | required | 场景到模型名的映射 |
