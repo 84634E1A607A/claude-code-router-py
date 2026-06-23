@@ -77,6 +77,7 @@ _STREAM_AFTER_FIRST_TOKEN_TIMEOUT_SEC = 90.0
 class DPRoutingDecision:
     provider_key: str | None = None
     provider_name: str | None = None
+    slot_id: str | None = None
     dp_size: int | None = None
     rank: int | None = None
     provider_dp_rank: int | None = None
@@ -1700,6 +1701,77 @@ def _log_dp_routing(provider: dict, decision: DPRoutingDecision, remapped: bool 
     )
 
 
+async def _reroute_sticky_key_after_timeout(model: str, decision: DPRoutingDecision | None) -> None:
+    if decision is None or decision.source != "session_system" or not decision.sticky_key or not decision.slot_id:
+        return
+
+    sticky_key = decision.sticky_key
+    timed_out_slot_id = decision.slot_id
+    timed_out_provider = decision.provider_name or decision.provider_key or "<unknown>"
+    slots = await _build_routing_slots(model, force_refresh=True)
+    replacement_candidates = [slot for slot in slots if slot.slot_id != timed_out_slot_id]
+    if not replacement_candidates:
+        logger.info(
+            "Timeout sticky reroute skipped model=%s sticky_key=%s timed_out_provider=%s "
+            "timed_out_slot=%s reason=no_alternative_slot",
+            model,
+            sticky_key,
+            timed_out_provider,
+            timed_out_slot_id,
+        )
+        return
+
+    allocator = _get_or_create_model_allocator(model, slots)
+    with _routing_lock:
+        current_slot_id = allocator.sessions.get(sticky_key)
+        if current_slot_id != timed_out_slot_id:
+            logger.info(
+                "Timeout sticky reroute skipped model=%s sticky_key=%s timed_out_provider=%s "
+                "timed_out_slot=%s current_slot=%s reason=session_already_moved",
+                model,
+                sticky_key,
+                timed_out_provider,
+                timed_out_slot_id,
+                current_slot_id,
+            )
+            return
+
+        slot_loads = _slot_loads_with_reservations_locked(replacement_candidates)
+        replacement = min(
+            replacement_candidates,
+            key=lambda slot: (
+                int(slot_loads.get(slot.slot_id, 0)),
+                allocator.slot_last_used.get(slot.slot_id, 0.0),
+                slot.flat_index,
+            ),
+        )
+        rerouted = allocator.reassign(sticky_key, replacement.slot_id)
+
+    if rerouted:
+        logger.warning(
+            "Timeout sticky reroute applied model=%s sticky_key=%s from_provider=%s from_slot=%s "
+            "from_provider_dp_rank=%s to_provider=%s to_slot=%s to_provider_dp_rank=%s",
+            model,
+            sticky_key,
+            timed_out_provider,
+            timed_out_slot_id,
+            decision.provider_dp_rank,
+            replacement.provider_name,
+            replacement.slot_id,
+            replacement.provider_dp_rank,
+        )
+        return
+
+    logger.info(
+        "Timeout sticky reroute skipped model=%s sticky_key=%s timed_out_provider=%s "
+        "timed_out_slot=%s reason=reassign_noop",
+        model,
+        sticky_key,
+        timed_out_provider,
+        timed_out_slot_id,
+    )
+
+
 def _maybe_reassign_busy_slot(
     allocator: StickySlotAllocator,
     sticky_key: str,
@@ -1773,6 +1845,7 @@ async def _resolve_dp_routing(
             decision = DPRoutingDecision(
                 provider_key=selected_slot.provider_key,
                 provider_name=selected_slot.provider_name,
+                slot_id=selected_slot.slot_id,
                 dp_size=selected_slot.dp_size,
                 rank=selected_slot.flat_index,
                 provider_dp_rank=selected_slot.provider_dp_rank,
@@ -1808,6 +1881,7 @@ async def _resolve_dp_routing(
         decision = DPRoutingDecision(
             provider_key=selected_slot.provider_key,
             provider_name=selected_slot.provider_name,
+            slot_id=selected_slot.slot_id,
             dp_size=selected_slot.dp_size,
             rank=selected_slot.flat_index,
             provider_dp_rank=selected_slot.provider_dp_rank,
@@ -1927,6 +2001,7 @@ async def _resolve_retry_routing(
         decision = DPRoutingDecision(
             provider_key=selected_slot.provider_key,
             provider_name=selected_slot.provider_name,
+            slot_id=selected_slot.slot_id,
             dp_size=selected_slot.dp_size,
             rank=selected_slot.flat_index,
             provider_dp_rank=selected_slot.provider_dp_rank,
@@ -2145,6 +2220,8 @@ async def _count_tokens_via_sglang(provider: dict, model: str, prompt: str) -> i
 @app.post("/v1/messages")
 async def messages(request: Request):
     hard_deadline, hard_timeout_sec = _request_hard_timeout(request)
+    model: str | None = None
+    dp_decision: DPRoutingDecision | None = None
     metrics_ctx: RequestMetricsContext | None = None
     metrics_finished = False
     metrics_handed_off = False
@@ -2329,6 +2406,7 @@ async def messages(request: Request):
                         openai_req,
                         stream,
                         model,
+                        dp_decision=dp_decision,
                         metrics_ctx=metrics_ctx,
                         hard_deadline=hard_deadline,
                         hard_timeout_sec=hard_timeout_sec,
@@ -2456,6 +2534,11 @@ async def messages(request: Request):
                 await stream.aclose()
             except Exception:
                 logger.debug("Failed to close timed out provider stream", exc_info=True)
+        if model is not None:
+            try:
+                await _reroute_sticky_key_after_timeout(model, dp_decision)
+            except Exception:
+                logger.exception("Failed to reroute sticky session after hard timeout")
         if not metrics_handed_off:
             _finish_metrics(success=False)
         logger.warning(
@@ -2470,6 +2553,7 @@ async def _stream_response(
     openai_req: dict,
     stream: ProviderStream,
     model: str,
+    dp_decision: DPRoutingDecision | None = None,
     metrics_ctx: RequestMetricsContext | None = None,
     hard_deadline: float | None = None,
     hard_timeout_sec: float | None = None,
@@ -2503,6 +2587,10 @@ async def _stream_response(
                 if hard_deadline is not None and now >= hard_deadline:
                     timeout_display = hard_timeout_sec if hard_timeout_sec is not None else _hard_timeout()
                     message = _hard_timeout_message(timeout_display)
+                    try:
+                        await _reroute_sticky_key_after_timeout(model, dp_decision)
+                    except Exception:
+                        logger.exception("Failed to reroute sticky session after streaming hard timeout")
                     logger.warning(
                         "Hard timeout exceeded for streaming response model=%s message_id=%s timeout_sec=%.1f",
                         model,

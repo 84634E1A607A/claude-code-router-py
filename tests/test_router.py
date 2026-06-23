@@ -3221,6 +3221,15 @@ class TestHardRequestTimeouts(unittest.IsolatedAsyncioTestCase):
         import server as srv_mod
 
         self.srv = srv_mod
+        self.srv._runtime_metrics.reset()
+        self.srv._dp_allocators.clear()
+        self.srv._model_allocators.clear()
+        self.srv._routing_reservations.clear()
+        self.srv._dp_size_cache.clear()
+        self.srv._sglang_health_cache.clear()
+        for task in self.srv._sglang_health_tasks.values():
+            task.cancel()
+        self.srv._sglang_health_tasks.clear()
         self.error_dump_dir = tempfile.TemporaryDirectory()
         self.error_dump_env = patch.dict(
             os.environ,
@@ -3250,6 +3259,15 @@ class TestHardRequestTimeouts(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.client.aclose()
+        self.srv._runtime_metrics.reset()
+        self.srv._dp_allocators.clear()
+        self.srv._model_allocators.clear()
+        self.srv._routing_reservations.clear()
+        self.srv._dp_size_cache.clear()
+        self.srv._sglang_health_cache.clear()
+        for task in self.srv._sglang_health_tasks.values():
+            task.cancel()
+        self.srv._sglang_health_tasks.clear()
         self.srv.set_config({})
         self.error_dump_env.stop()
         self.error_dump_dir.cleanup()
@@ -3263,6 +3281,17 @@ class TestHardRequestTimeouts(unittest.IsolatedAsyncioTestCase):
         if extra:
             req.update(extra)
         return req
+
+    def _openai_resp(self, text="PONG"):
+        return {
+            "id": "chatcmpl-test",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1},
+        }
 
     async def test_messages_nonstream_hard_timeout_returns_504_and_finishes_metrics(self):
         async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
@@ -3411,6 +3440,236 @@ class TestHardRequestTimeouts(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lines[0]["result"]["type"], "succeeded")
         self.assertEqual(lines[-1]["type"], "error")
         self.assertIn("hard timeout", lines[-1]["error"]["message"])
+
+    async def test_nonstream_hard_timeout_reroutes_next_sticky_request_to_other_provider(self):
+        self.srv.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "HARD_TIMEOUT_MS": 100,
+            "Providers": [
+                {
+                    "name": "first",
+                    "model": "/model",
+                    "api_base_url": "http://first:8000/v1/chat/completions",
+                    "api_key": "k1",
+                    "max_retries": 1,
+                },
+                {
+                    "name": "second",
+                    "model": "/model",
+                    "api_base_url": "http://second:8000/v1/chat/completions",
+                    "api_key": "k2",
+                    "max_retries": 1,
+                },
+            ],
+            "Router": {"default": "/model"},
+        })
+        session_id = "timeout-provider-reroute"
+        sent_urls = []
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_urls.append(url)
+            if len(sent_urls) == 1:
+                await asyncio.sleep(0.2)
+            return self._openai_resp()
+
+        with patch.object(self.srv, "_count_request_input_tokens", new=AsyncMock(return_value=(0, None))), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            first = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._CLAUDE_SESSION_HEADER: session_id},
+            )
+            second = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._CLAUDE_SESSION_HEADER: session_id},
+            )
+
+        self.assertEqual(first.status_code, 504, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(sent_urls, [
+            "http://first:8000/v1/chat/completions",
+            "http://second:8000/v1/chat/completions",
+        ])
+        self.assertEqual(second.headers["X-Router-Provider"], "second")
+
+    async def test_stream_hard_timeout_reroutes_next_sticky_request_to_other_provider(self):
+        self.srv.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "HARD_TIMEOUT_MS": 100,
+            "Providers": [
+                {
+                    "name": "first",
+                    "model": "/model",
+                    "api_base_url": "http://first:8000/v1/chat/completions",
+                    "api_key": "k1",
+                    "max_retries": 1,
+                },
+                {
+                    "name": "second",
+                    "model": "/model",
+                    "api_base_url": "http://second:8000/v1/chat/completions",
+                    "api_key": "k2",
+                    "max_retries": 1,
+                },
+            ],
+            "Router": {"default": "/model"},
+        })
+        session_id = "timeout-stream-reroute"
+        stream_urls = []
+        post_urls = []
+
+        class FakeProviderStream:
+            def __init__(self):
+                self.closed = False
+
+            async def __aiter__(self):
+                yield (
+                    "data: "
+                    + json.dumps({
+                        "id": "x",
+                        "choices": [{"index": 0, "delta": {"content": "PONG"}, "finish_reason": None}],
+                    })
+                ).encode()
+                await asyncio.sleep(0.2)
+                yield b"data: [DONE]"
+
+            async def aclose(self):
+                self.closed = True
+
+        fake_stream = FakeProviderStream()
+
+        async def fake_open_stream(url, headers, body, timeout=600.0, max_retries=3):
+            stream_urls.append(url)
+            return fake_stream
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            post_urls.append(url)
+            return self._openai_resp()
+
+        with patch.object(self.srv, "_count_request_input_tokens", new=AsyncMock(return_value=(0, None))), \
+             patch.object(self.srv, "open_provider_stream", new=AsyncMock(side_effect=fake_open_stream)), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            first = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req({"stream": True}),
+                headers={
+                    self.srv._CLAUDE_SESSION_HEADER: session_id,
+                    "Accept": "text/event-stream",
+                },
+            )
+            second = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._CLAUDE_SESSION_HEADER: session_id},
+            )
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertIn("hard timeout", first.text)
+        self.assertTrue(fake_stream.closed)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(stream_urls, ["http://first:8000/v1/chat/completions"])
+        self.assertEqual(post_urls, ["http://second:8000/v1/chat/completions"])
+        self.assertEqual(second.headers["X-Router-Provider"], "second")
+
+    async def test_nonstream_hard_timeout_reroutes_next_sticky_request_to_other_dp_rank(self):
+        self.srv.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "HARD_TIMEOUT_MS": 100,
+            "Providers": [{
+                "name": "dp-timeout",
+                "model": "/model",
+                "api_base_url": "http://dp-timeout:8000/v1/chat/completions",
+                "api_key": "k",
+                "max_retries": 1,
+                "dp_routing": {"enabled": True, "server_info_ttl_sec": 30},
+            }],
+            "Router": {"default": "/model"},
+        })
+        session_id = "timeout-dp-reroute"
+        sent_ranks = []
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_ranks.append(body.get("routed_dp_rank"))
+            if len(sent_ranks) == 1:
+                await asyncio.sleep(0.2)
+            return self._openai_resp()
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=2)), \
+             patch.object(self.srv, "_count_request_input_tokens", new=AsyncMock(return_value=(0, None))), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            slots = await self.srv._build_routing_slots("/model")
+            self.assertEqual(len(slots), 2)
+            first = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._CLAUDE_SESSION_HEADER: session_id},
+            )
+            second = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._CLAUDE_SESSION_HEADER: session_id},
+            )
+
+        self.assertEqual(first.status_code, 504, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(sent_ranks, [0, 1])
+        self.assertEqual(second.headers["X-Router-Provider-DP-Rank"], "1")
+        self.assertEqual(second.headers["X-Router-DP-Rank"], "1")
+
+    async def test_override_timeout_does_not_mutate_sticky_routing(self):
+        self.srv.set_config({
+            "API_TIMEOUT_MS": 60000,
+            "HARD_TIMEOUT_MS": 100,
+            "Providers": [{
+                "name": "dp-override",
+                "model": "/model",
+                "api_base_url": "http://dp-override:8000/v1/chat/completions",
+                "api_key": "k",
+                "max_retries": 1,
+                "dp_routing": {"enabled": True, "server_info_ttl_sec": 30},
+            }],
+            "Router": {"default": "/model"},
+        })
+        session_id = "timeout-override-preserve"
+        sent_ranks = []
+
+        async def fake_post(url, headers, body, timeout=600.0, max_retries=3):
+            sent_ranks.append(body.get("routed_dp_rank"))
+            if len(sent_ranks) == 2:
+                await asyncio.sleep(0.2)
+            return self._openai_resp()
+
+        with patch.object(self.srv, "_get_provider_dp_size", new=AsyncMock(return_value=2)), \
+             patch.object(self.srv, "_count_request_input_tokens", new=AsyncMock(return_value=(0, None))), \
+             patch.object(self.srv, "post_json", new=AsyncMock(side_effect=fake_post)):
+            slots = await self.srv._build_routing_slots("/model")
+            self.assertEqual(len(slots), 2)
+            warm = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._CLAUDE_SESSION_HEADER: session_id},
+            )
+            timed_out = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={
+                    self.srv._CLAUDE_SESSION_HEADER: session_id,
+                    self.srv._DP_OVERRIDE_HEADER: "1",
+                },
+            )
+            final = await self.client.post(
+                "/v1/messages",
+                json=self._messages_req(),
+                headers={self.srv._CLAUDE_SESSION_HEADER: session_id},
+            )
+
+        self.assertEqual(warm.status_code, 200, warm.text)
+        self.assertEqual(timed_out.status_code, 504, timed_out.text)
+        self.assertEqual(final.status_code, 200, final.text)
+        self.assertEqual(sent_ranks, [0, 1, 0])
+        self.assertEqual(final.headers["X-Router-Provider-DP-Rank"], "0")
+        self.assertEqual(final.headers["X-Router-DP-Rank"], "0")
 
 
 # ============================================================================
