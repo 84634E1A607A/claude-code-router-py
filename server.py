@@ -70,7 +70,6 @@ _CONFIG_RELOAD_INTERVAL_SEC = 1.0
 _MAIN_REQUEST_PRIORITY = 0
 _PROVIDER_RETRY_STATUSES = {429, 500, 502, 503, 504}
 _LOG_REDACTED_HEADERS = {"authorization", "proxy-authorization", "x-api-key", "cookie"}
-_STREAM_AFTER_FIRST_TOKEN_TIMEOUT_SEC = 90.0
 
 
 @dataclass
@@ -1114,6 +1113,11 @@ def _timeout() -> float:
 def _hard_timeout() -> float:
     """Read HARD_TIMEOUT_MS from config, handling string or numeric values."""
     return float(_config.get("HARD_TIMEOUT_MS", 300_000)) / 1000
+
+
+def _stream_after_first_token_timeout() -> float:
+    """Read STREAM_AFTER_FIRST_TOKEN_TIMEOUT_MS from config, handling string or numeric values."""
+    return float(_config.get("STREAM_AFTER_FIRST_TOKEN_TIMEOUT_MS", 90_000)) / 1000
 
 
 def _format_timeout_seconds(timeout_sec: float) -> str:
@@ -2567,6 +2571,7 @@ async def _stream_response(
     completed = False
     first_content_seen = False
     stream_deadline: float | None = None
+    stream_timeout_sec = _stream_after_first_token_timeout()
     content_delta_types = {"text_delta", "thinking_delta", "input_json_delta"}
     event_stream = stream_openai_to_anthropic(stream, message_id, model)
     event_iter = event_stream.__aiter__()
@@ -2607,14 +2612,14 @@ async def _stream_response(
                     "Streaming timeout after first content model=%s message_id=%s timeout_sec=%.1f",
                     model,
                     message_id,
-                    _STREAM_AFTER_FIRST_TOKEN_TIMEOUT_SEC,
+                    stream_timeout_sec,
                 )
                 error_event = {
                     "type": "error",
                     "error": {
                         "type": "api_error",
                         "message": (
-                            f"Stream exceeded {_STREAM_AFTER_FIRST_TOKEN_TIMEOUT_SEC:.0f}s "
+                            f"Stream exceeded {stream_timeout_sec:.0f}s "
                             "after first content event"
                         ),
                     },
@@ -2637,7 +2642,7 @@ async def _stream_response(
                 ):
                     first_content_seen = True
                     stream_deadline = (
-                        asyncio.get_running_loop().time() + _STREAM_AFTER_FIRST_TOKEN_TIMEOUT_SEC
+                        asyncio.get_running_loop().time() + stream_timeout_sec
                     )
             # Accumulate text for debug check (zero cost when CCR_DEBUG is off)
             if _text_buf is not None:

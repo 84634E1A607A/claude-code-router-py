@@ -762,7 +762,7 @@ class TestStreamResponseTimeout(unittest.IsolatedAsyncioTestCase):
 
         fake_stream = FakeProviderStream()
 
-        with patch.object(self.srv, "_STREAM_AFTER_FIRST_TOKEN_TIMEOUT_SEC", 0.01):
+        with patch.dict(self.srv._config, {"STREAM_AFTER_FIRST_TOKEN_TIMEOUT_MS": 10}, clear=True):
             events = await self._collect_stream_events(fake_stream)
 
         self.assertTrue(fake_stream.closed)
@@ -804,7 +804,7 @@ class TestStreamResponseTimeout(unittest.IsolatedAsyncioTestCase):
 
         fake_stream = FakeProviderStream()
 
-        with patch.object(self.srv, "_STREAM_AFTER_FIRST_TOKEN_TIMEOUT_SEC", 0.01):
+        with patch.dict(self.srv._config, {"STREAM_AFTER_FIRST_TOKEN_TIMEOUT_MS": 10}, clear=True):
             events = await self._collect_stream_events(fake_stream)
 
         self.assertTrue(fake_stream.closed)
@@ -841,7 +841,7 @@ class TestStreamResponseTimeout(unittest.IsolatedAsyncioTestCase):
 
         fake_stream = FakeProviderStream()
 
-        with patch.object(self.srv, "_STREAM_AFTER_FIRST_TOKEN_TIMEOUT_SEC", 0.01):
+        with patch.dict(self.srv._config, {"STREAM_AFTER_FIRST_TOKEN_TIMEOUT_MS": 10}, clear=True):
             events = await self._collect_stream_events(fake_stream)
 
         self.assertTrue(fake_stream.closed)
@@ -871,7 +871,7 @@ class TestStreamResponseTimeout(unittest.IsolatedAsyncioTestCase):
         self.srv._runtime_metrics.reset()
         ctx = self.srv._runtime_metrics.start_request("provider-key", "provider-name", 0, True, input_tokens=0)
 
-        with patch.object(self.srv, "_STREAM_AFTER_FIRST_TOKEN_TIMEOUT_SEC", 0.01):
+        with patch.dict(self.srv._config, {"STREAM_AFTER_FIRST_TOKEN_TIMEOUT_MS": 10}, clear=True):
             events = await self._collect_stream_events(fake_stream, metrics_ctx=ctx)
 
         self.assertTrue(fake_stream.closed)
@@ -973,6 +973,17 @@ class TestConfig(unittest.TestCase):
         })
         self.assertEqual(cfg["HARD_TIMEOUT_MS"], 300_000)
 
+    def test_validate_config_defaults_stream_after_first_token_timeout(self):
+        cfg = validate_config({
+            "Providers": [{
+                "name": "foo",
+                "model": "/model",
+                "api_base_url": "http://host/v1/chat/completions",
+            }],
+            "Router": {"default": "/model"},
+        })
+        self.assertEqual(cfg["STREAM_AFTER_FIRST_TOKEN_TIMEOUT_MS"], 90_000)
+
     def test_validate_config_accepts_explicit_hard_timeout(self):
         cfg = validate_config({
             "HARD_TIMEOUT_MS": 12345,
@@ -984,6 +995,18 @@ class TestConfig(unittest.TestCase):
             "Router": {"default": "/model"},
         })
         self.assertEqual(cfg["HARD_TIMEOUT_MS"], 12345)
+
+    def test_validate_config_accepts_explicit_stream_after_first_token_timeout(self):
+        cfg = validate_config({
+            "STREAM_AFTER_FIRST_TOKEN_TIMEOUT_MS": 12345,
+            "Providers": [{
+                "name": "foo",
+                "model": "/model",
+                "api_base_url": "http://host/v1/chat/completions",
+            }],
+            "Router": {"default": "/model"},
+        })
+        self.assertEqual(cfg["STREAM_AFTER_FIRST_TOKEN_TIMEOUT_MS"], 12345)
 
 class TestApplyProviderParams(unittest.TestCase):
 

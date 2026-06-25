@@ -2,6 +2,7 @@
   "PORT": 3456,
   "API_TIMEOUT_MS": 850000,
   "HARD_TIMEOUT_MS": 300000,
+  "STREAM_AFTER_FIRST_TOKEN_TIMEOUT_MS": 180000,
   "Providers": [
     {
       "name": "zai",

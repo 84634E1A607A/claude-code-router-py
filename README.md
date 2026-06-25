@@ -110,6 +110,7 @@ python main.py [--config PATH]
   "PORT": 3456,
   "API_TIMEOUT_MS": 120000,
   "HARD_TIMEOUT_MS": 300000,
+  "STREAM_AFTER_FIRST_TOKEN_TIMEOUT_MS": 90000,
   "tokenizer_path": "/models/default-tokenizer",
   "Providers": [
     {
@@ -147,6 +148,7 @@ python main.py [--config PATH]
 | `PORT` | `int` | `3456` | `main.py` 监听端口 |
 | `API_TIMEOUT_MS` | `int` | `600000` | 单次上游 HTTP 操作超时 |
 | `HARD_TIMEOUT_MS` | `int` | `300000` | 整个客户端请求的硬超时；超时后强制关闭连接 |
+| `STREAM_AFTER_FIRST_TOKEN_TIMEOUT_MS` | `int` | `90000` | 流式响应在首个内容事件之后的空闲超时 |
 | `tokenizer_path` | `string` | `null` | 默认 tokenizer 路径 |
 | `Providers` | `list` | required | provider 列表 |
 | `Router` | `object` | required | 场景到模型名的映射 |
